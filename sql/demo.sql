@@ -73,6 +73,12 @@ CREATE TABLE dim_account (
     'hbase.rpc.timeout' = '600', -- 单次 RPC 超时（ms）
     'hbase.client.operation.timeout' = '2000', -- 客户端操作总超时，含 region location 冷启动定位，要给足
     'hbase.client.retries.number' = '1',
+    -- ===== HBase Kerberos（可选，默认 simple 免认证；启用时取消下面注释）=====
+    -- 'hbase.security.authentication' = 'kerberos',
+    -- 'hbase.client.kerberos.principal' = 'hbase/ro@EXAMPLE.COM',
+    -- 'hbase.client.keytab.file' = '/path/to/hbase.keytab',
+    -- 'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM',
+    -- 'hbase.kerberos.krb5.conf' = '/etc/krb5.conf',
     -- ===== Doris =====
     'doris.jdbc-url' = 'jdbc:mysql://192.168.214.128:9030/dim?useSSL=false&serverTimezone=Asia/Shanghai',
     'doris.table-name' = 'dim.dim_account',

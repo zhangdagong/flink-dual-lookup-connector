@@ -197,6 +197,19 @@ public class DualLookupFunction extends AsyncLookupFunction {
 
     @Override
     public void close() throws Exception {
+        // 兜底：把攒批缓冲里尚未 flush 的请求补空，避免异步算子等待永不完成的 future
+        if (lock != null) {
+            List<CompletableFuture<Collection<RowData>>> pending;
+            synchronized (lock) {
+                pending = new ArrayList<>(batchFutures);
+                batchKeys.clear();
+                batchFutures.clear();
+                flushScheduled = false;
+            }
+            for (CompletableFuture<Collection<RowData>> f : pending) {
+                f.complete(Collections.emptyList());
+            }
+        }
         if (stats != null) {
             stats.close();
         }

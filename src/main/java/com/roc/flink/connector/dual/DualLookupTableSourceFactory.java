@@ -74,6 +74,12 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         optional.add(DualLookupOptions.HBASE_RPC_TIMEOUT_MS);
         optional.add(DualLookupOptions.HBASE_OPERATION_TIMEOUT_MS);
         optional.add(DualLookupOptions.HBASE_RETRIES);
+        optional.add(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION);
+        optional.add(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE);
+        optional.add(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL);
+        optional.add(DualLookupOptions.HBASE_REGIONSERVER_KERBEROS_PRINCIPAL);
+        optional.add(DualLookupOptions.HBASE_MASTER_KERBEROS_PRINCIPAL);
+        optional.add(DualLookupOptions.HBASE_KRB5_CONF);
 
         optional.add(DualLookupOptions.DORIS_TABLE_NAME);
         optional.add(DualLookupOptions.DORIS_USERNAME);

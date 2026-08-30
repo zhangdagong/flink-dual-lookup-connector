@@ -85,6 +85,34 @@ public final class DualLookupOptions {
     public static final ConfigOption<Integer> HBASE_RETRIES =
             ConfigOptions.key("hbase.client.retries.number").intType().defaultValue(1);
 
+    // ---- HBase Kerberos（可选，默认 simple 免认证） ----
+
+    /** 认证方式：simple（默认）或 kerberos */
+    public static final ConfigOption<String> HBASE_SECURITY_AUTHENTICATION =
+            ConfigOptions.key("hbase.security.authentication")
+                    .stringType()
+                    .defaultValue("simple");
+
+    /** 客户端 keytab 文件路径（kerberos 下必填） */
+    public static final ConfigOption<String> HBASE_CLIENT_KEYTAB_FILE =
+            ConfigOptions.key("hbase.client.keytab.file").stringType().noDefaultValue();
+
+    /** 客户端 Kerberos principal，如 hbase/ro@EXAMPLE.COM（kerberos 下必填） */
+    public static final ConfigOption<String> HBASE_CLIENT_KERBEROS_PRINCIPAL =
+            ConfigOptions.key("hbase.client.kerberos.principal").stringType().noDefaultValue();
+
+    /** RegionServer 的 Kerberos principal，如 hbase/_HOST@EXAMPLE.COM（可选，缺省用 _HOST 规则） */
+    public static final ConfigOption<String> HBASE_REGIONSERVER_KERBEROS_PRINCIPAL =
+            ConfigOptions.key("hbase.regionserver.kerberos.principal").stringType().noDefaultValue();
+
+    /** Master 的 Kerberos principal（可选） */
+    public static final ConfigOption<String> HBASE_MASTER_KERBEROS_PRINCIPAL =
+            ConfigOptions.key("hbase.master.kerberos.principal").stringType().noDefaultValue();
+
+    /** krb5.conf 路径（可选，默认用系统 /etc/krb5.conf） */
+    public static final ConfigOption<String> HBASE_KRB5_CONF =
+            ConfigOptions.key("hbase.kerberos.krb5.conf").stringType().noDefaultValue();
+
     // ==================== Doris ====================
 
     public static final ConfigOption<String> DORIS_JDBC_URL =
@@ -156,6 +184,12 @@ public final class DualLookupOptions {
         public int hbaseRpcTimeoutMs;
         public int hbaseOperationTimeoutMs;
         public int hbaseRetries;
+        public String hbaseSecurityAuthentication;
+        public String hbaseClientKeytabFile;
+        public String hbaseClientKerberosPrincipal;
+        public String hbaseRegionserverKerberosPrincipal;
+        public String hbaseMasterKerberosPrincipal;
+        public String hbaseKrb5Conf;
 
         public String dorisJdbcUrl;
         public String dorisTableName;
@@ -193,6 +227,12 @@ public final class DualLookupOptions {
             cfg.hbaseRpcTimeoutMs = c.get(HBASE_RPC_TIMEOUT_MS);
             cfg.hbaseOperationTimeoutMs = c.get(HBASE_OPERATION_TIMEOUT_MS);
             cfg.hbaseRetries = c.get(HBASE_RETRIES);
+            cfg.hbaseSecurityAuthentication = c.get(HBASE_SECURITY_AUTHENTICATION);
+            cfg.hbaseClientKeytabFile = c.getOptional(HBASE_CLIENT_KEYTAB_FILE).orElse("");
+            cfg.hbaseClientKerberosPrincipal = c.getOptional(HBASE_CLIENT_KERBEROS_PRINCIPAL).orElse("");
+            cfg.hbaseRegionserverKerberosPrincipal = c.getOptional(HBASE_REGIONSERVER_KERBEROS_PRINCIPAL).orElse("");
+            cfg.hbaseMasterKerberosPrincipal = c.getOptional(HBASE_MASTER_KERBEROS_PRINCIPAL).orElse("");
+            cfg.hbaseKrb5Conf = c.getOptional(HBASE_KRB5_CONF).orElse("");
 
             cfg.dorisJdbcUrl = c.get(DORIS_JDBC_URL);
             cfg.dorisTableName = c.getOptional(DORIS_TABLE_NAME).orElse(ddlTableName);
@@ -218,6 +258,13 @@ public final class DualLookupOptions {
             }
             if (cfg.dorisJdbcUrl == null || cfg.dorisJdbcUrl.trim().isEmpty()) {
                 throw new IllegalArgumentException("[dual-lookup] doris.jdbc-url 必填");
+            }
+            if ("kerberos".equalsIgnoreCase(cfg.hbaseSecurityAuthentication)
+                    && (cfg.hbaseClientKeytabFile.trim().isEmpty()
+                    || cfg.hbaseClientKerberosPrincipal.trim().isEmpty())) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] hbase.security.authentication=kerberos 时，"
+                                + "hbase.client.keytab.file 与 hbase.client.kerberos.principal 必填");
             }
             return cfg;
         }

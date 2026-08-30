@@ -41,7 +41,7 @@ CREATE TABLE dim_account (
 ) WITH (
     'connector'              = 'dual-lookup',
     'lookup.primary'         = 'hbase',     -- 主源；改 'doris' 即对调
-    'lookup.timeout'         = '500 ms',    -- 主源超时阈值
+    'lookup.timeout'         = '500',       -- 主源超时阈值（毫秒，无需带 ms）
     'hbase.zookeeper.quorum' = 'localhost',
     'doris.jdbc-url'         = 'jdbc:mysql://192.168.214.128:9030/risk'
 );
@@ -83,6 +83,17 @@ ON t.account_no = d.account_no;
 | `hbase.rpc.timeout` | `300` | 单次 RPC 超时（毫秒） |
 | `hbase.client.operation.timeout` | `500` | 客户端整体操作超时（毫秒），含 region 冷启动定位，建议给足 |
 | `hbase.client.retries.number` | `1` | 重试次数，实时链路建议 0~1 |
+
+**HBase Kerberos 参数**（可选，默认 `simple` 免认证）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `hbase.security.authentication` | `simple` | 认证方式，`simple` 或 `kerberos` |
+| `hbase.client.keytab.file` | — | 客户端 keytab 文件路径（kerberos 下必填） |
+| `hbase.client.kerberos.principal` | — | 客户端 principal，如 `hbase/ro@EXAMPLE.COM`（kerberos 下必填） |
+| `hbase.regionserver.kerberos.principal` | — | RegionServer principal，如 `hbase/_HOST@EXAMPLE.COM` |
+| `hbase.master.kerberos.principal` | — | Master principal |
+| `hbase.kerberos.krb5.conf` | — | krb5.conf 路径，缺省用系统 `/etc/krb5.conf` |
 
 **Doris 参数**（`doris.jdbc-url` 必填，表名缺省取 DDL 表名）：
 
@@ -130,6 +141,28 @@ ON t.account_no = d.account_no;
 
 说明：主源命中时 `lookup_source` 是主源、`lookup_cost_ms` 是主源耗时；主源超时降级后，`lookup_source` 变为备源、`lookup_cost_ms` 是主源超时 + 备源查询的总耗时；主源查不到（空结果）时两者均为 NULL（LEFT JOIN 补 NULL）。
 
+## 3.6 Kerberos 认证（可选）
+
+HBase 2.2.0+ 内置了 keytab 自动登录与 TGT 续期，本连接器只需在 DDL 里配置即可，无需手动 `kinit`：
+
+```sql
+CREATE TABLE dim_account (...) WITH (
+    'connector'                             = 'dual-lookup',
+    'hbase.security.authentication'         = 'kerberos',
+    'hbase.client.kerberos.principal'       = 'hbase/ro@EXAMPLE.COM',
+    'hbase.client.keytab.file'              = '/path/to/hbase.keytab',
+    'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM',
+    -- 可选：自定义 krb5.conf，缺省用系统 /etc/krb5.conf
+    'hbase.kerberos.krb5.conf'              = '/path/to/krb5.conf',
+    'doris.jdbc-url'                        = 'jdbc:mysql://...'
+);
+```
+
+要点：
+- `hbase.client.kerberos.principal` 与 `hbase.client.keytab.file` 二者**同时**配置才会生效，缺一会报错。
+- keytab 必须放在**每台 TaskManager** 都能访问的路径（共享存储或随镜像分发），且对 Flink 运行账号可读。
+- TGT 续期由 HBase 客户端自动完成，长期运行的作业无需担心凭据过期。
+
 ## 4. 关键设计
 
 ### 4.1 超时机制
@@ -156,6 +189,15 @@ JDBC 是阻塞 API，超时不能靠 `thread.interrupt`（JDBC 不响应）。�
 ### 4.4 惰性建连
 
 主源在作业启动时不可用（如 HBase 整体宕机），作业也能正常起来直接走备源，无需等主源恢复。
+
+### 4.5 防连接/线程打满
+
+Doris 的 JDBC 查询在独立线程池执行（线程数 = `doris.pool.size`）。若 Doris 出现慢查询而 JDBC 层不先中止，慢查询会在业务层超时降级后仍占着连接与线程，很快把池子打满。为此做了两层保护：
+
+1. **超时真正中断后端**（见 4.2）：`lookup.timeout` 超时后调 `Statement.cancel()` 让 Doris 中止 SQL。
+2. **JDBC queryTimeout 自动收敛**：实际生效的 `doris.query.timeout` 被钳制到 `≤ ceil(lookup.timeout/1000)` 秒，保证 JDBC 层最迟在业务层超时前后自行中止，及时释放线程与连接。
+
+另外，作业取消（`close`）时会把攒批缓冲里尚未发出的请求补空，避免异步算子等待永不完成的 future。
 
 ## 5. 故障演练
 
@@ -187,6 +229,9 @@ src/main/java/com/roc/flink/connector/dual/
 
 ## 7. 已知限制
 
-- 每次查询都是单条点查，未做攒批（`WHERE pk IN` / HBase 批量 Get）。
-- 不支持 Kerberos 认证的 HBase。
-- HBase 侧要求所有列在同一列族。
+- HBase 侧要求所有列在同一列族（DDL 所有业务列都从 `hbase.column-family` 下按列名读取）。
+- 不支持主键嵌套结构（PRIMARY KEY 必须是普通列）。
+- 无熔断保护：主源长时间宕机时，每批数据仍需等 `lookup.timeout` 超时才降级，吞吐受超时限制。
+  这是「精简优先」的取舍，若需要抗主源整体宕机，可后续加熔断。
+- HBase 建连失败会阻塞在 `open()`（`createAsyncConnection().get()` 等待 ZooKeeper 超时），
+  此时该批请求会被同步阻塞，需依赖 ZooKeeper/客户端超时兜底。

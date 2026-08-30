@@ -76,6 +76,9 @@ public class HBaseLookupReader implements LookupReader {
         hbaseConf.setInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT, cfg.hbaseOperationTimeoutMs);
         hbaseConf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, cfg.hbaseRetries);
 
+        // Kerberos：在建连前完成认证配置，HBase 2.2.0+ 会据此自动登录并续期
+        applyKerberos(hbaseConf);
+
         connection = ConnectionFactory.createAsyncConnection(hbaseConf).get();
         table = connection.getTable(TableName.valueOf(cfg.hbaseTableName));
         familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
@@ -97,6 +100,35 @@ public class HBaseLookupReader implements LookupReader {
         opened = true;
         LOG.info("[dual-lookup] HBase reader opened, table={}, family={}, zk={}",
                 cfg.hbaseTableName, cfg.hbaseColumnFamily, cfg.hbaseZkQuorum);
+    }
+
+    /**
+     * 配置 Kerberos 认证。HBase 2.2.0+ 的 ConnectionFactory 只要发现
+     * {@code hbase.client.keytab.file} + {@code hbase.client.kerberos.principal}，
+     * 就会自动完成登录和 TGT 续期，应用侧无需再手动调用 UserGroupInformation。
+     */
+    private void applyKerberos(Configuration conf) {
+        if (!"kerberos".equalsIgnoreCase(cfg.hbaseSecurityAuthentication)) {
+            return;
+        }
+        if (!cfg.hbaseKrb5Conf.trim().isEmpty()) {
+            System.setProperty("java.security.krb5.conf", cfg.hbaseKrb5Conf.trim());
+        }
+        conf.set("hbase.security.authentication", "kerberos");
+        if (!cfg.hbaseClientKeytabFile.trim().isEmpty()) {
+            conf.set("hbase.client.keytab.file", cfg.hbaseClientKeytabFile.trim());
+        }
+        if (!cfg.hbaseClientKerberosPrincipal.trim().isEmpty()) {
+            conf.set("hbase.client.kerberos.principal", cfg.hbaseClientKerberosPrincipal.trim());
+        }
+        if (!cfg.hbaseRegionserverKerberosPrincipal.trim().isEmpty()) {
+            conf.set("hbase.regionserver.kerberos.principal", cfg.hbaseRegionserverKerberosPrincipal.trim());
+        }
+        if (!cfg.hbaseMasterKerberosPrincipal.trim().isEmpty()) {
+            conf.set("hbase.master.kerberos.principal", cfg.hbaseMasterKerberosPrincipal.trim());
+        }
+        LOG.info("[dual-lookup] HBase Kerberos enabled, principal={}, keytab={}",
+                cfg.hbaseClientKerberosPrincipal, cfg.hbaseClientKeytabFile);
     }
 
     @Override

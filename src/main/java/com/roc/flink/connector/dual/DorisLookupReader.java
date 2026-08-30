@@ -172,7 +172,11 @@ public class DorisLookupReader implements LookupReader {
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
                 stmtRef.set(ps);
-                ps.setQueryTimeout(Math.max(1, cfg.dorisQueryTimeoutSec));
+                // JDBC queryTimeout 必须 <= lookup.timeout，否则 Doris 慢查询会在业务层超时降级后
+                // 仍占用查询线程与连接，直到 JDBC 层才中止，从而把线程池和连接池打满。
+                int jdbcTimeoutSec = Math.max(1, Math.min(cfg.dorisQueryTimeoutSec,
+                        (int) Math.ceil(cfg.timeoutMs / 1000.0)));
+                ps.setQueryTimeout(jdbcTimeoutSec);
                 int idx = 1;
                 for (Object[] k : validKeys) {
                     for (Object v : k) {
