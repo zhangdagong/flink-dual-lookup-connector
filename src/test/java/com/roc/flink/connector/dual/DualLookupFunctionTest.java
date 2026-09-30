@@ -11,6 +11,7 @@ import org.junit.Test;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -325,17 +326,51 @@ public class DualLookupFunctionTest {
         assertTrue("主源成功的一批必须留下耗时样本: " + line1,
                 line1.contains("hbase[batches=1 keys=1 fail=0 avg="));
         assertTrue("未降级时备源不应有任何样本: " + line1,
-                line1.contains("doris[batches=0 fail=0 avg=-]"));
+                line1.contains("doris[batches=0 fail=0 avg=- max=- hit=-]"));
 
         primary.failWith = new RuntimeException("primary down");
         fn.asyncLookup(key("b")).get(3, TimeUnit.SECONDS); // 主源失败 -> 整批降级
         String line2 = statsOf(fn).snapshotLine();
         assertTrue("失败批次也要计入主源耗时，否则主源恶化过程会被掩盖: " + line2,
-                line2.contains("hbase[batches=1 keys=1 fail=1 avg="));
+                line2.contains("hbase[batches=1 keys=1 fail=1(other=1) avg="));
         assertTrue("降级后备源必须留下耗时样本: " + line2,
                 line2.contains("doris[batches=1 fail=0 avg="));
         assertTrue("降级次数应同步: " + line2, line2.contains("failover=1"));
         fn.close();
+    }
+
+    /**
+     * 接线测试：确认命中率统计真的接在分发链路上。
+     *
+     * <p>只测 {@link LookupStats} 本身证明不了 {@code distribute()} 报了正确的命中数——
+     * 一旦有人删掉那行统计、或把分母写成别的数，统计类的测试仍然全绿，
+     * 而「维表大面积查不到」这条最危险的故障（表被误删、rowkey 编码写错、备源同步延迟）
+     * 又会重新隐身。因此这里跑真实路由，再反射取出统计对象检查命中率。
+     */
+    @Test
+    public void hitRateIsRecordedFromDistribution() throws Exception {
+        RecordingReader primary = new RecordingReader();
+        DualLookupFunction fn = newFunction(primary, new RecordingReader(), 3, 1000);
+
+        // 一批 3 个 key，只有第 1 个（下标 0）查到行 -> 命中 1/3
+        Map<Integer, List<Map<String, Object>>> oneHit = new HashMap<>();
+        oneHit.put(0, Collections.singletonList(newResultRow("a")));
+        primary.result = oneHit;
+
+        fn.asyncLookup(key("a"));
+        fn.asyncLookup(key("b"));
+        fn.asyncLookup(key("c")).get(3, TimeUnit.SECONDS); // 攒满 3 条触发整批查询
+
+        String line = statsOf(fn).snapshotLine();
+        assertTrue("命中率必须来自 distribute 的实际命中数（1/3）: " + line, line.contains("hit=33.3%]"));
+        fn.close();
+    }
+
+    /** 构造一行维表结果（DDL 只声明了主键列 pk，其余无需给出） */
+    private static Map<String, Object> newResultRow(String pk) {
+        Map<String, Object> row = new HashMap<>();
+        row.put("pk", pk);
+        return row;
     }
 
     /** 反射取出 Function 内部的统计对象（它是 transient 运行期状态，没有对外 getter） */
@@ -382,6 +417,8 @@ public class DualLookupFunctionTest {
         final List<Long> times = Collections.synchronizedList(new ArrayList<Long>());
         final AtomicInteger calls = new AtomicInteger();
         volatile Throwable failWith;
+        /** 命中结果：默认空（全部未命中），测试可改写它以驱动命中率统计 */
+        volatile Map<Integer, List<Map<String, Object>>> result = Collections.emptyMap();
 
         @Override
         public CompletableFuture<Map<Integer, List<Map<String, Object>>>> batchLookupAsync(List<Object[]> keys) {
@@ -393,7 +430,7 @@ public class DualLookupFunctionTest {
                 f.completeExceptionally(failWith);
                 return f;
             }
-            return CompletableFuture.completedFuture(Collections.emptyMap());
+            return CompletableFuture.completedFuture(result);
         }
 
         @Override

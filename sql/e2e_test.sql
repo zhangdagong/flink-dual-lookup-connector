@@ -77,7 +77,8 @@ CREATE TABLE dim_account (
     'lookup.batch.max-wait' = '30',          -- D 组案例 20 的主配置；案例 21 用第 6 节的 max-wait=5 变体对比
     -- ---- 日志 ----
     'lookup.stats.log-interval' = '10',      -- 统计日志每 10 秒一行（D 组要观察 avgBatch，间隔调小便于读取；
-                                             -- 每行两个视角：window= 段是这 10 秒的增量，since-start 段是自启动累计）
+                                             -- 每行两个视角：window= 段是这 10 秒的增量，since-start 段是自启动累计；
+                                             -- 案例 10 看 hbase[... hit=0.0%]，案例 14/16 看 fail= 分类与 max=）
     'lookup.failover.log-interval' = '10',   -- 降级 WARN 限流：首条必打 + 之后每 10s 一条（0 = 不限流，逐批打印）
     -- ---- HBase ----
     'hbase.zookeeper.quorum' = '127.0.0.1',

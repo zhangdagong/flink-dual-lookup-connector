@@ -65,8 +65,9 @@ CREATE TABLE dim_account (
                                     --（每子任务 QPS × max-wait），调太小会让攒批形同虚设；
                                     -- 必须小于 lookup.timeout，否则建表时会被校验拦下
     -- ===== 日志 =====
-    'lookup.stats.log-interval' = '360', -- 每 6 分钟打一行统计（一行两个视角：window= 本阶段增量 +
-                                         -- since-start 自启动累计，含各源平均耗时；排查期间可临时调小到 10~30 秒）
+    'lookup.stats.log-interval' = '360', -- 每 6 分钟打一行统计（一行两个视角：window= 本阶段增量 + since-start 自启动累计；
+                                         -- 含吞吐 rate、各源命中率 hit、平均 avg 与最长 max 耗时、失败原因分类、
+                                         -- 降级波及的 key 数与占比；排查期间可临时调小到 10~30 秒）
     'lookup.failover.log-interval' = '10', -- 降级日志最小间隔（秒）：主源长故障时把 WARN 限流成
                                         --「首条必打 + 每 10s 一条 + 合并计数」，避免日志洪峰。
                                         -- 设为 0 = 不限流（每批降级都打印，用于故障复盘）

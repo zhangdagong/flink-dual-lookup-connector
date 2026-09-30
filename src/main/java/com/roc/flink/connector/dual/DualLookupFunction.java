@@ -148,11 +148,28 @@ public class DualLookupFunction extends AsyncLookupFunction {
             t.setDaemon(true);
             return t;
         });
-        stats = new LookupStats(tableName, cfg.primary, cfg.standby, cfg.statsLogIntervalSec);
+        stats = new LookupStats(tableName, cfg.primary, cfg.standby, cfg.statsLogIntervalSec, configSummary());
         stats.start();
         // 限流间隔从「秒」换算成「毫秒」；<=0 时闸门退化为不限流（visit 恒返回 >=0）
         failoverGate = new FailoverLogGate(cfg.failoverLogIntervalSec * 1000L);
         initialized = true;
+    }
+
+    /**
+     * 配置摘要：由统计模块在启动时打一次。
+     *
+     * <p>为什么要打这一行：TM 日志里每个子任务各打一份，事后有人捞到一段日志时，
+     * 光看统计数字无法判断「当时是什么参数」——而这恰恰是判断「数字是否正常」的前提。
+     * 只列真正影响行为的几个参数，完整参数在作业提交记录里。
+     */
+    private String configSummary() {
+        return "primary=" + cfg.primary
+                + " standby=" + cfg.standby
+                + " batch.size=" + cfg.batchSize
+                + " batch.max-wait=" + cfg.batchMaxWaitMs + "ms"
+                + " lookup.timeout=" + cfg.timeoutMs + "ms"
+                + " stats.interval=" + cfg.statsLogIntervalSec + "s"
+                + " failover.interval=" + cfg.failoverLogIntervalSec + "s";
     }
 
     /**
@@ -263,8 +280,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
             }
             // ---- 进入降级分支 ----
             Throwable cause = unwrap(ex);
-            stats.recordPrimaryFail();
-            stats.recordFailover();
+            stats.recordPrimaryFail(cause);          // 顺带按异常类型归类（超时/连接/池满/…）
+            stats.recordFailover(keys.size());       // 记 key 数：降级"影响多少条记录"比"降了几批"更有信息量
             warnFailover(keys.size(), cause);
 
             // 备源耗时从「真正发起备源查询」的那一刻起算，不含前面等主源超时的那段时间——
@@ -340,6 +357,11 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * <p>未命中的 key 补 {@code emptyList()} 而不是留空——Lookup Join 需要明确知道
      * 「查过了、但没查到」，Future 必须完成，否则算子的缓冲会一直被占用。
      *
+     * <p>分发的同时顺手统计命中率：本连接器的核心语义是「查不到不算异常、不降级」，
+     * 于是「维表大面积查不到」这条最危险的故障在 {@code fail=}/{@code failover=} 上完全隐身
+     * （表被误删、rowkey 编码写错、备源同步延迟都会这样）。命中率是唯一能把它照出来的指标，
+     * 而这里本来就要逐个 key 判断是否命中，记账是零成本的。
+     *
      * @param source     本次结果来自哪个源；降级后这里会是备源名
      * @param startNanos 批次开始时间，用于算总耗时（降级场景下含主源超时时间）
      */
@@ -347,6 +369,7 @@ public class DualLookupFunction extends AsyncLookupFunction {
                             Map<Integer, List<Map<String, Object>>> resultMap,
                             String source, long startNanos) {
         long costMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        int hits = 0;
         for (int i = 0; i < futures.size(); i++) {
             List<Map<String, Object>> rows = resultMap.get(i);
             if (rows == null || rows.isEmpty()) {
@@ -354,6 +377,9 @@ public class DualLookupFunction extends AsyncLookupFunction {
                 futures.get(i).complete(Collections.emptyList());
                 continue;
             }
+            // 命中：只要这个 key 有行就算命中（维表一对多时也只算 1 个 key，
+            // 否则命中率会随着维表行数放大成无意义的数）
+            hits++;
             // 元信息直接写进行 Map，由 RowDataConverter.resolveValue 读取：
             // 这样无需改动 Reader 的返回结构，元字段的实现对两个 Reader 完全透明
             for (Map<String, Object> row : rows) {
@@ -362,6 +388,9 @@ public class DualLookupFunction extends AsyncLookupFunction {
             }
             futures.get(i).complete(toRows(rows));
         }
+        // 分母用本次查询覆盖的 key 数，而不是全部批次：失败的批次根本没有"命中率"可言，
+        // 若并入分母，主源一故障（查都没查成）命中率就会莫名下跌，指标随之失去意义
+        stats.recordHits(source, hits, futures.size());
     }
 
     /**

@@ -106,7 +106,9 @@ python sql/gen_test_data.py
 | 要看什么 | 在哪里 |
 |---|---|
 | print 结果表输出 | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.out` |
-| 统计日志（avgBatch / 各源 avg 耗时 / failover） | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.log \| grep dual-lookup`。⚠️ 每行有**两个视角**用 `\|\|` 分隔：前半段 `window=` 是本阶段增量，后半段 `since-start` 是自启动累计（TM 重启后归零）。判断「最近是否变慢」只看前半段 |
+| 统计日志（hit / avgBatch / 各源 avg+max 耗时 / failover 影响面） | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.log \| grep dual-lookup`。⚠️ 每行有**两个视角**用 `\|\|` 分隔：前半段 `window=` 是本阶段增量，后半段 `since-start` 是自启动累计（TM 重启后归零）。判断「最近是否变慢」只看前半段 |
+| 配置回执（启动时 1 行） | 同上，关键字 `cfg[`。确认本次作业的 batch.size / timeout 等参数，便于对照后面读到的数字 |
+| **命中率异常（维表疑似缺数据）** | 同上，看 `hit=`。本连接器「查不到不算异常」，因此**只有这个字段**能暴露「表被删/rowkey 编码错/源数据缺失」——`fail=` 与 `failover=` 在这种场景下会保持 0 |
 | 降级 WARN 日志 | 同上，关键字「降级到备源」（**默认按 10s 限流**，见案例 14 注） |
 | 建连日志（rowkeyEncoding=） | 同上，关键字「reader opened」 |
 | 作业状态 / 异常 | Flink Web UI（默认 8081） |
@@ -172,7 +174,7 @@ python sql/gen_test_data.py
 | # | 案例 | 观察点 | 预期 |
 |---|---|---|---|
 | 9 | 命中主源 | A001~A010 的输出 | `account_name=Name01~Name10`，`lookup_source=hbase`，`lookup_cost_ms>0`；字段值与 HBase 写入一致 |
-| 10 | 两源都没有 | A901~A905 的输出 | 维表列全 NULL、`lookup_source` 为 NULL；TM 日志**无**降级 WARN；统计日志 `doris[batches=0]` |
+| 10 | 两源都没有 | A901~A905 的输出 | 维表列全 NULL、`lookup_source` 为 NULL；TM 日志**无**降级 WARN；统计日志 `doris[batches=0]`，且 **`hbase[... hit=0.0%]`**——命中率归零是这类「维表查不到」唯一的可观测信号 |
 | 11 | 仅 Doris 有 | A011~A020 的输出 | **同样全 NULL、不降级**——这是核心语义：HBase 查不到是正常业务结果，不会去 Doris 补查。若你的业务期望「HBase 没有就查 Doris」，那是另一套语义，本连接器刻意不支持 |
 | 12 | 批内重复 key | 连发 3 次的 A001 | 3 条输出**都**有 `account_name=Name01`（曾有的静默丢数据缺陷，回归验证） |
 | 13 | 元字段 | 同一批输出的 `lookup_cost_ms` | 同批内相同（批次耗时）；案例 14 降级期间该值 ≈ 500 + Doris 耗时 |
@@ -187,10 +189,10 @@ python sql/gen_test_data.py
 
 | # | 操作 | 预期 |
 |---|---|---|
-| 14 | `stop-hbase.sh` | 约 1 个批次周期后出现 WARN「降级到备源 doris」；输出继续且字段完整，`lookup_source` 变为 `doris`，A011~A020 此时**能查到了**（因为直接查 Doris）；统计 `failover` 持续增长，且 `doris[batches=... avg=..]` 开始出现真实耗时（此前恒为 `avg=-`） |
+| 14 | `stop-hbase.sh` | 约 1 个批次周期后出现 WARN「降级到备源 doris」；输出继续且字段完整，`lookup_source` 变为 `doris`，A011~A020 此时**能查到了**（因为直接查 Doris）；统计里 `failover=2(90keys,1.7%)` 这类形态持续增长（**括号内是波及的 key 数与占比**），`hbase[... fail=N(timeout=N)]` 给出失败原因分类，且 `doris[batches=... avg=.. max=.. hit=..]` 开始出现真实数值（此前恒为 `-`） |
 | 15 | `start-hbase.sh`，等 1~2 分钟 | `lookup_source` 恢复为 `hbase`。⚠️ 若 2 分钟后仍全是 doris（旧连接已失效），重启作业即可——这是已知取舍，见 README 第 14 节 |
-| 16 | `tc qdisc add dev eth0 root netem delay 600ms`（600ms > lookup.timeout） | 超时降级，WARN 出现 `HBase lookup timeout after 500ms`；`tc qdisc del dev eth0 root netem` 恢复。此时统计日志里 `hbase[... avg=..]` 会明显抬升到 ≈500ms 以上——**这正是「主源在变慢」的可观测信号**，且失败批次的耗时也计入 |
-| 17 | 停 Doris（`docker stop` 或停 FE/BE），HBase 正常 | 输出完全无变化，`lookup_source` 保持 `hbase`；统计日志里 `doris[...]` 恒为 `batches=0 avg=-`（备源压根没被调用） |
+| 16 | `tc qdisc add dev eth0 root netem delay 600ms`（600ms > lookup.timeout） | 超时降级，WARN 出现 `HBase lookup timeout after 500ms`；`tc qdisc del dev eth0 root netem` 恢复。此时统计日志里 `hbase[... avg=..]` 会明显抬升到 ≈500ms 以上、**`max=` 会直接顶到 500ms（贴着超时上限）**——`avg` 与 `max` 一起看，正是「主源在变慢」的可观测信号，且失败批次的耗时也计入 |
+| 17 | 停 Doris（`docker stop` 或停 FE/BE），HBase 正常 | 输出完全无变化，`lookup_source` 保持 `hbase`；统计日志里 `doris[...]` 恒为 `batches=0 avg=- max=- hit=-`（备源压根没被调用） |
 | 18 | 在 17 基础上再停 HBase | 两源都失败 → 作业**失败抛异常**（不静默补空，属预期行为）；恢复任一源后重启作业可继续 |
 | 19 | 恢复 Doris、保持 HBase 停止，**重启一个全新的 B 组作业** | 作业正常启动不报错（惰性建连），从一开始 `lookup_source=doris` |
 
@@ -213,7 +215,7 @@ python sql/gen_test_data.py
 
 | # | 案例 | 预期 |
 |---|---|---|
-| 20 | 主配置（max-wait=30）跑 burst | 统计日志 `avgBatch` 接近 50（2000×0.03=60，被 batch.size=50 封顶）；`avgBatch ≈ avgBatchWithStandby`（无降级） |
+| 20 | 主配置（max-wait=30）跑 burst | 统计日志 `avgBatch` 接近 50（2000×0.03=60，被 batch.size=50 封顶）；`avgBatch ≈ avgBatchWithStandby`（无降级）；`hit=100.0%`（测试数据在维表里都有），`fail=0`（此时分类不会展开） |
 | 21 | 停掉 20 的作业，改用 e2e_test.sql 里注释掉的 `dim_account_mw5`（max-wait=5）跑同样 burst | `avgBatch` 只有 ≈10（2000×0.005）——直观看到「默认 5ms 攒批近乎失效」。⚠️ 两个作业不要同时跑：同 group.id 会瓜分同一 topic 的消息，互相干扰 |
 | 22 | （可选）把 hint 里 `capacity` 改成 `10`，继续 burst | Web UI 可见反压（busy/backpressured），证明缓冲容量是吞吐上限的第一约束；改回 200 恢复 |
 
