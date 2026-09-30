@@ -1,0 +1,32 @@
+# ================= 构建产物 =================
+# target 下有 fat jar（含 HBase/MySQL/HikariCP，体积数十 MB），绝不能提交
+/target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# ================= IDE =================
+# .idea 下多为个人环境状态（workspace.xml、编译输出路径、SDK 配置等），
+# 提交后极易产生无意义冲突；如团队需要共享代码风格，只放 .idea/codeStyles 一个目录即可
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.classpath
+*.project
+
+# ================= Python =================
+# sql/gen_test_data.py 是唯一脚本，__pycache__ 是运行 py_compile 检查时产生的字节码
+__pycache__/
+*.py[cod]
+
+# ================= 日志与临时文件 =================
+*.log
+hs_err_pid*.log
+replay_pid*.log
+*.tmp
+*.swp
+*~
+
+# ================= 系统文件 =================
+.DS_Store
+Thumbs.db
