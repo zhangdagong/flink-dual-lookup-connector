@@ -106,8 +106,8 @@ python sql/gen_test_data.py
 | 要看什么 | 在哪里 |
 |---|---|
 | print 结果表输出 | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.out` |
-| 统计日志（avgBatch / failover） | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.log \| grep dual-lookup` |
-| 降级 WARN 日志 | 同上，关键字「降级到备源」 |
+| 统计日志（avgBatch / 各源 avg 耗时 / failover） | `tail -f $FLINK_HOME/log/flink-*-taskexecutor-*.log \| grep dual-lookup`。⚠️ 每行有**两个视角**用 `\|\|` 分隔：前半段 `window=` 是本阶段增量，后半段 `since-start` 是自启动累计（TM 重启后归零）。判断「最近是否变慢」只看前半段 |
+| 降级 WARN 日志 | 同上，关键字「降级到备源」（**默认按 10s 限流**，见案例 14 注） |
 | 建连日志（rowkeyEncoding=） | 同上，关键字「reader opened」 |
 | 作业状态 / 异常 | Flink Web UI（默认 8081） |
 
@@ -147,7 +147,7 @@ python sql/gen_test_data.py
 
 ## A 组：建表校验（不需要发数据）
 
-在 SQL Client 里逐条执行 `sql/e2e_test.sql` 末尾注释掉的 DDL。
+在 SQL Client 里逐条执行 `sql/e2e_test.sql` **第 5 节**里注释掉的 8 个 DDL（含案例 1 的对照表）。
 
 | # | 步骤 | 预期（报错关键字） |
 |---|---|---|
@@ -187,20 +187,29 @@ python sql/gen_test_data.py
 
 | # | 操作 | 预期 |
 |---|---|---|
-| 14 | `stop-hbase.sh` | 约 1 个批次周期后出现 WARN「降级到备源 doris」；输出继续且字段完整，`lookup_source` 变为 `doris`，A011~A020 此时**能查到了**（因为直接查 Doris）；统计 `failover` 持续增长 |
+| 14 | `stop-hbase.sh` | 约 1 个批次周期后出现 WARN「降级到备源 doris」；输出继续且字段完整，`lookup_source` 变为 `doris`，A011~A020 此时**能查到了**（因为直接查 Doris）；统计 `failover` 持续增长，且 `doris[batches=... avg=..]` 开始出现真实耗时（此前恒为 `avg=-`） |
 | 15 | `start-hbase.sh`，等 1~2 分钟 | `lookup_source` 恢复为 `hbase`。⚠️ 若 2 分钟后仍全是 doris（旧连接已失效），重启作业即可——这是已知取舍，见 README 第 14 节 |
-| 16 | `tc qdisc add dev eth0 root netem delay 600ms`（600ms > lookup.timeout） | 超时降级，WARN 出现 `HBase lookup timeout after 500ms`；`tc qdisc del dev eth0 root netem` 恢复 |
-| 17 | 停 Doris（`docker stop` 或停 FE/BE），HBase 正常 | 输出完全无变化，`lookup_source` 保持 `hbase` |
+| 16 | `tc qdisc add dev eth0 root netem delay 600ms`（600ms > lookup.timeout） | 超时降级，WARN 出现 `HBase lookup timeout after 500ms`；`tc qdisc del dev eth0 root netem` 恢复。此时统计日志里 `hbase[... avg=..]` 会明显抬升到 ≈500ms 以上——**这正是「主源在变慢」的可观测信号**，且失败批次的耗时也计入 |
+| 17 | 停 Doris（`docker stop` 或停 FE/BE），HBase 正常 | 输出完全无变化，`lookup_source` 保持 `hbase`；统计日志里 `doris[...]` 恒为 `batches=0 avg=-`（备源压根没被调用） |
 | 18 | 在 17 基础上再停 HBase | 两源都失败 → 作业**失败抛异常**（不静默补空，属预期行为）；恢复任一源后重启作业可继续 |
 | 19 | 恢复 Doris、保持 HBase 停止，**重启一个全新的 B 组作业** | 作业正常启动不报错（惰性建连），从一开始 `lookup_source=doris` |
 
 **通过标准**：14/16/19 降级链路全部符合预期；17 证明备源故障不影响主路径；18 证明不静默丢数据。
+
+> **案例 14 注：降级 WARN 默认被限流。**`lookup.failover.log-interval` 默认 10 秒，
+> 所以 HBase 停掉后你看到的 WARN 是「首条 + 之后每 10 秒一条」，而不是每批一条——
+> 这是有意设计（5000 条/分的流量下每批一条约 285 万行/天，会把故障起点冲掉）。
+> 每条日志末尾会带「距上次打印又发生 N 批降级已被合并」，N 才是真实降级批数；
+> 精确总量看统计日志的 `failover=` 字段。想逐批留痕就把该参数设为 `0`。
+> 案例 15 恢复 HBase 后，应看到一条 INFO「主源 hbase 已恢复，重新由主源提供数据（本次故障共降级 N 批）」。
 
 ---
 
 ## D 组：性能与攒批
 
 **步骤**：`gen_test_data.py` 用 `MODE='burst', RATE=2000`。统计日志已调成 10 秒一行。
+
+> 读数值前先确认行首的 `window=` 确实约为 10——日志里的每个数字都只描述这一个窗口，不是自启动累计。
 
 | # | 案例 | 预期 |
 |---|---|---|

@@ -94,6 +94,7 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         optional.add(DualLookupOptions.BATCH_SIZE);
         optional.add(DualLookupOptions.BATCH_MAX_WAIT);
         optional.add(DualLookupOptions.STATS_LOG_INTERVAL);
+        optional.add(DualLookupOptions.FAILOVER_LOG_INTERVAL);
 
         // HBase 连接与超时
         optional.add(DualLookupOptions.HBASE_TABLE_NAME);

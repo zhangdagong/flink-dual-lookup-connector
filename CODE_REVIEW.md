@@ -375,18 +375,19 @@ t=25.10s 主源 hbase 已恢复，重新由主源提供数据（本次故障共�
 因此不需要启动 Doris / HBase / Flink 就能跑，适合放进 CI 作为发布门槛。
 
 ```bash
-mvn test          # 45 个用例，不依赖任何外部服务
+mvn test          # 53 个用例，不依赖任何外部服务
 mvn clean package # 打 fat jar
 ```
 
 | 测试类 | 用例数 | 覆盖内容 |
 |---|---|---|
-| `DualLookupOptionsTest` | 11 | 默认值自洽性、6 条交叉校验、枚举归一化、表名回退、`failover.log-interval` 边界 |
+| `DualLookupOptionsTest` | 12 | 默认值自洽性、6 条交叉校验、枚举归一化、表名回退、两个日志间隔的边界（含 `stats.log-interval` 负数拒绝） |
 | `DorisLookupReaderTest` | 9 | 批内重复主键分发、超时打断、队列满降级、空 key 短路、IN 子句形态、byte[]/BigDecimal 按内容匹配、超时任务取消、**Doris 宕机 open() 不被建池自检拖住** |
-| `DualLookupFunctionTest` | 12 | 攒满即发、时间兜底、**残留定时器不冲下一批**、主备降级、**空结果不降级**、两源失败不补空、关闭补空、close 后降级链不重新建连、降级日志闸门（首条+采样+合并、interval=0、reset、**反射验证接线**） |
+| `DualLookupFunctionTest` | 13 | 攒满即发、时间兜底、**残留定时器不冲下一批**、主备降级、**空结果不降级**、两源失败不补空、关闭补空、close 后降级链不重新建连、降级日志闸门（首条+采样+合并、interval=0、reset、**反射验证接线**）、**各源耗时埋点接线** |
 | `HBaseLookupReaderTest` | 1 | 已完成查询取消超时任务、调度器队列清空 |
 | `HBaseRowKeyEncodingTest` | 5 | 两种编码模式的字节结果、复合主键拼接、编码→解码往返、空 key |
 | `RowDataConverterTest` | 7 | 全类型双向转换、元字段、大小写兼容、异构后端类型归一化、时间多形态 |
+| `LookupStatsTest` | 6 | **阶段值而非累计值**、**每行都带累计视角且阶段/累计守恒**、各源平均耗时互相独立、无样本显示 `-`、关闭时累计汇总、interval=0 不建线程 |
 
 **配置项校验规则**（建表期失败，共 6 条跨字段校验）：
 
@@ -401,7 +402,7 @@ mvn clean package # 打 fat jar
 
 另有 `lookup.primary` ∈ {hbase, doris}、`hbase.rowkey.encoding` ∈ {string, typed}、
 `lookup.timeout > 0`、`batch.size > 0`、`batch.max-wait >= 0`、`failover.log-interval >= 0`、
-`doris.jdbc-url` 必填、Kerberos 下 keytab 与 principal 成对等若干条。
+`stats.log-interval >= 0`、`doris.jdbc-url` 必填、Kerberos 下 keytab 与 principal 成对等若干条。
 
 ---
 
@@ -446,3 +447,77 @@ mvn clean package # 打 fat jar
 - **监听主源恢复并自动重连**：当前 HBase 侧旧连接失效后需重启作业（README 第 14 章、TEST_PLAN 案例 15）；
 - **Flink Metric 上报**：异步 Lookup Function 不是 `RichFunction`，拿不到 `RuntimeContext`，暂用定时日志；
 - **Doris 侧查询缓存**：官方 Doris Connector 的 lookup join 三项优化中，本项目已实现异步与攒批，尚缺缓存。
+
+---
+
+## 十二、后续变更记录（非缺陷，按使用反馈发起）
+
+### 12.1 统计日志：默认 6 分钟、输出阶段值、新增各源平均耗时
+
+**背景**：原统计日志一行里全是**自启动累计值**（`totalKeys=1203400`、`batches=25071`……），
+要看「最近一段发生了什么」得自己拿两行做减法；而运维最常问的两个问题恰恰是
+「**这一段时间**主源有没有变慢」和「备源现在多快」，前者原来完全没有指标。
+
+**改动**：
+
+| 项 | 变更前 | 变更后 |
+|---|---|---|
+| `lookup.stats.log-interval` 默认值 | 60（秒） | **360（秒）**，即 6 分钟一行 |
+| 数值口径 | 自启动累计 | **本阶段增量**，行首给出 `window=Ns` |
+| 各源耗时 | 无 | `hbase[... avg=8.3ms]` / `doris[... avg=15.1ms]`，无样本显示 `-` |
+| 长期总量 | 靠单行累计体现 | 行尾 `since-start` 段给累计；作业关闭时若还有新活动再补打一次 |
+| 负间隔 | 静默等价于关闭 | 建表期报错（与 `failover.log-interval` 规则对齐） |
+
+**实现要点**：内部计数**仍是累计值**（因此漏看某行不会丢数），打点时用「当前 − 上次快照」
+换算区间值——刻意不用「清零」，否则一次漏打（如 INFO 被过滤）就会把那批数据永久丢掉。
+
+**两个耗时口径**，都是有意为之：
+1. **失败批次的耗时也计入**。只统计成功批次的话，「主源正在变慢、开始不断超时」这段恶化过程会被完全掩盖；
+2. **备源耗时从真正发起备源查询那一刻起算**，不含前面等主源超时的时间。否则主源越慢备源数字越难看，指标失去诊断价值。
+
+**测试**：新增 `LookupStatsTest`（5 例）+ `DualLookupFunctionTest.latencyIsRecordedForEachSource`
+（反射读真实 Function 的统计对象，验证埋点确实接在路由链路上）+ `DualLookupOptionsTest` 默认值与负数校验。
+合计 45 → **52 个用例全部通过**。
+
+**兼容性提示**：统计日志的字段变了（多了 `window=` 与两个 `avg=`），
+如果有脚本在解析这行日志，需要同步调整；判别「新版是否已生效」最快的办法就是看有没有 `avg=`。
+
+### 12.2 统计日志补齐累计视角 + 长期运行开销评估
+
+**背景（用户反馈）**：改造后 `window=` 段只看得到本阶段，`since-start` 汇总却只在作业关闭时才打一行——
+作业连跑几个月不重启，**全程总量实际上永远看不到**。同时用户提出一个更根本的问题：
+这种统计日志对资源消耗和性能有没有影响，尤其是长期运行？
+
+**改动**：每次打点**一行内同时给出两个视角**，用 `||` 分隔：
+
+```
+[dual-lookup] table=dim_account window=360s totalKeys=5400 ... failover=2 || table=dim_account since-start totalKeys=9900 ... failover=2
+```
+
+| 项 | 变更前 | 变更后 |
+|---|---|---|
+| 单行内容 | 只有本阶段 | 本阶段 + 自启动累计 |
+| `since-start` | 仅作业关闭时补打 | **每行都有**；关闭时只在「上次打点后还有新活动」时补打，避免重复 |
+| 计数读取 | 各字段分别 `get()` | 一次读成不可变 `Sample`（9 个 long），两段共用 → `本行阶段 + 此前累计 = 本行累计` 恒成立 |
+| 打点任务抛异常 | 被 `scheduleAtFixedRate` **静默取消**后续调度 | `try/catch (Throwable)` 兜住 + 首次失败告警一次 |
+| 关闭时补打条件 | 只要查过就打 | `interval > 0` + 有活动 + 自上次打点后有新活动 |
+
+「一次读成 Sample」不是洁癖：两段若各自读原子变量，就可能出现「since-start 比 stage 少 3 批」这类
+自相矛盾的数字，看日志的人只会去查一个并不存在的 bug。
+
+**长期运行开销评估**（结论：可忽略）：
+
+| 维度 | 量级 |
+|---|---|
+| 打点 CPU | 每 6 分钟几十微秒（9 次原子读 + 一次格式化 + 一次写日志），占比 **< 0.001%** |
+| 埋点 CPU | 每批 4 次原子自增 ≈ < 0.1μs，而每批本身是一次毫秒级 RPC/查询，占比 **< 0.01%** |
+| 常驻内存 | **固定约 200 字节**（9 个 `AtomicLong`，无集合/缓存/队列），跑一个月与跑一年完全相同 |
+| 日志体积 | 约 240 行/天/子任务 ≈ 77KB/天，一年约 28MB（8 并发约 224MB/年） |
+| 计数溢出 | long 上限 9.22×10^18；纳秒累计要「1000 批/秒 × 10ms/批」连跑 **29 年**才触及，key 计数要 5000 万年 |
+
+唯一需要运维动作的是日志滚动——Flink 1.18 的 TM appender 默认已是 `100MB × 10`，无需额外配置。
+不想有任何开销就把 `lookup.stats.log-interval` 设为 `0`：连打点线程都不创建。
+
+**测试**：`LookupStatsTest` 5 → 6 例，新增 `everySnapshotCarriesCumulativeView`——
+专门盯住「累计段不能把阶段值抄一遍」（那样两个视角会退化成同一个数字，而单看任何一行都发现不了）。
+合计 52 → **53 个用例全部通过**，真实输出样本见 README 第 8 章。

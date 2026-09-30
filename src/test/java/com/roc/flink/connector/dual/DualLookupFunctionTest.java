@@ -227,6 +227,124 @@ public class DualLookupFunctionTest {
         assertEquals(0, standby.calls.get());
     }
 
+    /**
+     * 降级日志限流闸门：首条必打，之后按间隔采样，并如实回报「被合并的批数」。
+     *
+     * <p>时间线由测试直接构造（{@code visit} 的时刻入参），不依赖真实时钟，
+     * 因此不会出现「机器慢/类加载导致偶发失败」的脆弱测试。
+     */
+    @Test
+    public void failoverLogGateEmitsFirstThenThrottlesByInterval() {
+        DualLookupFunction.FailoverLogGate gate = new DualLookupFunction.FailoverLogGate(10_000L);
+
+        // 第 1 批：故障起点，必须打印，且此刻无被合并的批次
+        assertEquals("首条降级日志必须打印（含真实原因），否则故障起点就丢了", 0L, gate.visit(1_000L));
+        // 间隔内的第 2、3 批：抑制
+        assertEquals(-1L, gate.visit(1_500L));
+        assertEquals(-1L, gate.visit(2_000L));
+        // 距上次打印满 10s：放行，并如实回报期间被合并了 2 批
+        assertEquals("放行时应带上被合并的批数，数量信息不能丢", 2L, gate.visit(11_000L));
+        // 第 5 批又落入新的间隔窗口：抑制
+        assertEquals(-1L, gate.visit(11_500L));
+
+        assertEquals("无论是否打印，总数都要精确累计（供恢复日志汇总）", 5L, gate.total());
+    }
+
+    @Test
+    public void failoverLogGateWithZeroIntervalEmitsEveryTime() {
+        // interval=0 表示不限流，退化为「每批一条」——即优化前的原始行为，必须仍然可用
+        DualLookupFunction.FailoverLogGate gate = new DualLookupFunction.FailoverLogGate(0L);
+        assertEquals(0L, gate.visit(1L));
+        assertEquals(0L, gate.visit(2L));
+        assertEquals(0L, gate.visit(3L));
+        assertEquals(3L, gate.total());
+    }
+
+    @Test
+    public void failoverLogGateResetStartsNewEpisode() {
+        DualLookupFunction.FailoverLogGate gate = new DualLookupFunction.FailoverLogGate(10_000L);
+        gate.visit(1_000L);
+        gate.visit(1_100L); // 被抑制
+        gate.reset();
+
+        assertEquals(0L, gate.total());
+        // 复位后「首条必打」规则重新生效：下一次降级必须打印，且合并计数从 0 开始
+        assertEquals(0L, gate.visit(1_200L));
+        assertEquals(1L, gate.total());
+    }
+
+    /**
+     * 接线测试：确认限流闸门真的被 {@code doBatchLookup} 使用、且主源恢复后会被清零。
+     *
+     * <p>只测 {@code FailoverLogGate} 本身不足以证明它被调用了——这段代码一旦被误删，
+     * 纯状态机测试仍会全绿，而线上又会退化成日志洪峰。这里通过反射读真实 Function 的状态，
+     * 把「接线」也纳入回归防线。
+     */
+    @Test
+    public void failoverGateIsWiredIntoRoutingAndClearedOnRecovery() throws Exception {
+        RecordingReader primary = new RecordingReader();
+        primary.failWith = new RuntimeException("primary down");
+        RecordingReader standby = new RecordingReader(); // 备源正常返回空结果
+        // batchSize=1 -> 每个 key 独立成批，便于精确控制「降级了多少批」
+        DualLookupFunction fn = newFunction(primary, standby, 1, 1000);
+
+        for (int i = 0; i < 5; i++) {
+            fn.asyncLookup(key("k" + i)).get(3, TimeUnit.SECONDS);
+        }
+
+        java.lang.reflect.Field f = DualLookupFunction.class.getDeclaredField("failoverGate");
+        f.setAccessible(true);
+        DualLookupFunction.FailoverLogGate gate = (DualLookupFunction.FailoverLogGate) f.get(fn);
+        assertNotNull("闸门应在 ensureOpened 里初始化", gate);
+        assertEquals("5 批降级都应被计数（限流只影响打印，不影响计数）", 5L, gate.total());
+        assertEquals("限流不应影响降级本身：5 批都应真的查了备源", 5, standby.calls.get());
+
+        // 主源恢复：降级计数必须清零，故障周期结束
+        primary.failWith = null;
+        fn.asyncLookup(key("ok")).get(3, TimeUnit.SECONDS);
+        assertEquals("主源恢复后应清零，否则下一次故障的首条日志会被误判为「间隔内」而抑制",
+                0L, gate.total());
+        fn.close();
+    }
+
+    /**
+     * 接线测试：确认「各源平均耗时」的埋点真的接到了路由链路上。
+     *
+     * <p>只测 {@link LookupStats} 本身证明不了 {@code DualLookupFunction} 传了正确的耗时——
+     * 埋点一旦被误删、或图省事改成传 0，统计类的测试仍会全绿，而线上再也看不出「哪个源变慢了」。
+     * 因此这里跑真实路由，再反射取出统计对象检查它的阶段快照。
+     */
+    @Test
+    public void latencyIsRecordedForEachSource() throws Exception {
+        RecordingReader primary = new RecordingReader();
+        RecordingReader standby = new RecordingReader();
+        DualLookupFunction fn = newFunction(primary, standby, 1, 1000); // batchSize=1 -> 每条立即成批
+
+        fn.asyncLookup(key("a")).get(3, TimeUnit.SECONDS);
+        String line1 = statsOf(fn).snapshotLine();
+        assertTrue("主源成功的一批必须留下耗时样本: " + line1,
+                line1.contains("hbase[batches=1 keys=1 fail=0 avg="));
+        assertTrue("未降级时备源不应有任何样本: " + line1,
+                line1.contains("doris[batches=0 fail=0 avg=-]"));
+
+        primary.failWith = new RuntimeException("primary down");
+        fn.asyncLookup(key("b")).get(3, TimeUnit.SECONDS); // 主源失败 -> 整批降级
+        String line2 = statsOf(fn).snapshotLine();
+        assertTrue("失败批次也要计入主源耗时，否则主源恶化过程会被掩盖: " + line2,
+                line2.contains("hbase[batches=1 keys=1 fail=1 avg="));
+        assertTrue("降级后备源必须留下耗时样本: " + line2,
+                line2.contains("doris[batches=1 fail=0 avg="));
+        assertTrue("降级次数应同步: " + line2, line2.contains("failover=1"));
+        fn.close();
+    }
+
+    /** 反射取出 Function 内部的统计对象（它是 transient 运行期状态，没有对外 getter） */
+    private static LookupStats statsOf(DualLookupFunction fn) throws Exception {
+        java.lang.reflect.Field f = DualLookupFunction.class.getDeclaredField("stats");
+        f.setAccessible(true);
+        return (LookupStats) f.get(fn);
+    }
+
     /** 假 Reader：batchLookupAsync 返回一个由测试手动控制的 Future，模拟「查询在途」 */
     static class PendingReader implements LookupReader {
 

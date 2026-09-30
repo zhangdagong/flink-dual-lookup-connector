@@ -64,8 +64,12 @@ CREATE TABLE dim_account (
     'lookup.batch.max-wait' = '30', -- 攒不满时最多等 30ms 就发。注意：有效批大小由它决定
                                     --（每子任务 QPS × max-wait），调太小会让攒批形同虚设；
                                     -- 必须小于 lookup.timeout，否则建表时会被校验拦下
-    -- ===== 统计日志 =====
-    'lookup.stats.log-interval' = '60', -- 每 60 秒打一行统计
+    -- ===== 日志 =====
+    'lookup.stats.log-interval' = '360', -- 每 6 分钟打一行统计（一行两个视角：window= 本阶段增量 +
+                                         -- since-start 自启动累计，含各源平均耗时；排查期间可临时调小到 10~30 秒）
+    'lookup.failover.log-interval' = '10', -- 降级日志最小间隔（秒）：主源长故障时把 WARN 限流成
+                                        --「首条必打 + 每 10s 一条 + 合并计数」，避免日志洪峰。
+                                        -- 设为 0 = 不限流（每批降级都打印，用于故障复盘）
     -- ===== HBase =====
     'hbase.zookeeper.quorum' = '127.0.0.1',
     'hbase.zookeeper.property.clientPort' = '2181',

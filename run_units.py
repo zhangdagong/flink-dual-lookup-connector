@@ -32,6 +32,7 @@ TEST_CLASSES = [
     "com.roc.flink.connector.dual.HBaseRowKeyEncodingTest",
     "com.roc.flink.connector.dual.HBaseLookupReaderTest",
     "com.roc.flink.connector.dual.RowDataConverterTest",
+    "com.roc.flink.connector.dual.LookupStatsTest",
 ]
 
 

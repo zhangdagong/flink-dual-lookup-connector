@@ -51,6 +51,34 @@ public class DualLookupOptionsTest {
         assertEquals(300, cfg.dorisConnectTimeoutMs);      // < lookup.timeout
         assertEquals(250, cfg.dorisPoolValidationTimeoutMs); // <= connect.timeout
         assertEquals("string", cfg.hbaseRowkeyEncoding);
+        assertEquals(10, cfg.failoverLogIntervalSec);        // 降级日志默认 10s 限流
+        assertEquals(360, cfg.statsLogIntervalSec);          // 统计日志默认 6 分钟一条
+    }
+
+    @Test
+    public void statsLogIntervalRejectsNegativeButAcceptsZero() {
+        // 负数与 0 在行为上无法区分（都等于关掉打点），与其静默照做不如在建表阶段拦下
+        Configuration bad = base();
+        bad.setInteger(DualLookupOptions.STATS_LOG_INTERVAL.key(), -1);
+        assertRejected(bad, "lookup.stats.log-interval");
+
+        // 0 是合法值：关闭统计打点（DualLookupFunctionTest 也依赖它来保证测试不额外起线程）
+        Configuration zero = base();
+        zero.setInteger(DualLookupOptions.STATS_LOG_INTERVAL.key(), 0);
+        assertEquals(0, parse(zero).statsLogIntervalSec);
+    }
+
+    @Test
+    public void failoverLogIntervalRejectsNegativeButAcceptsZero() {
+        // 负间隔无意义（0 已表达「不限流」），必须拦下来，避免被当成「关闭日志」误用
+        Configuration bad = base();
+        bad.setInteger(DualLookupOptions.FAILOVER_LOG_INTERVAL.key(), -1);
+        assertRejected(bad, "lookup.failover.log-interval");
+
+        // 0 是合法值：表示不限流、每批降级都打印（保留原始行为）
+        Configuration zero = base();
+        zero.setInteger(DualLookupOptions.FAILOVER_LOG_INTERVAL.key(), 0);
+        assertEquals(0, parse(zero).failoverLogIntervalSec);
     }
 
     @Test

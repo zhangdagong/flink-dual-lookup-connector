@@ -100,6 +100,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
     private transient ScheduledFuture<?> pendingFlush;
     /** 运行期统计 */
     private transient LookupStats stats;
+    /** 降级日志限流闸门（主源长故障时把 WARN 洪峰压平） */
+    private transient FailoverLogGate failoverGate;
     /** 是否已完成初始化（保证 ensureOpened 幂等） */
     private transient volatile boolean initialized;
 
@@ -148,6 +150,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
         });
         stats = new LookupStats(tableName, cfg.primary, cfg.standby, cfg.statsLogIntervalSec);
         stats.start();
+        // 限流间隔从「秒」换算成「毫秒」；<=0 时闸门退化为不限流（visit 恒返回 >=0）
+        failoverGate = new FailoverLogGate(cfg.failoverLogIntervalSec * 1000L);
         initialized = true;
     }
 
@@ -245,11 +249,15 @@ public class DualLookupFunction extends AsyncLookupFunction {
      */
     private void doBatchLookup(List<Object[]> keys, List<CompletableFuture<Collection<RowData>>> futures) {
         long startNanos = System.nanoTime(); // 计时起点的唯一来源：含降级时长的总耗时由此算出
-        stats.recordPrimaryBatch(keys.size());
 
         call(primary, keys).whenComplete((resultMap, ex) -> {
+            // 主源这一批的耗时（成功、失败都记）：失败批次的耗时同样是主源健康度的关键指标，
+            // 只统计成功批次会把「主源正在变慢、开始不断超时」这段恶化过程完全掩盖掉。
+            // 在完成回调里才计时，才能保证「批次数」与「耗时样本数」严格一一对应
+            stats.recordPrimaryBatch(keys.size(), System.nanoTime() - startNanos);
             if (ex == null) {
                 // 主源正常返回（包含「查不到」的情况，那是正常业务结果，不算失败）
+                infoRecovered();
                 distribute(futures, resultMap, cfg.primary, startNanos);
                 return;
             }
@@ -257,11 +265,13 @@ public class DualLookupFunction extends AsyncLookupFunction {
             Throwable cause = unwrap(ex);
             stats.recordPrimaryFail();
             stats.recordFailover();
-            LOG.warn("[dual-lookup] 主源 {} 批量查询失败，降级到备源 {}。批大小={}，原因：{}",
-                    cfg.primary, cfg.standby, keys.size(), cause.toString());
+            warnFailover(keys.size(), cause);
 
-            stats.recordStandbyBatch();
+            // 备源耗时从「真正发起备源查询」的那一刻起算，不含前面等主源超时的那段时间——
+            // 否则主源越慢，备源的「平均耗时」就越难看，指标就失去了诊断价值
+            long standbyStartNanos = System.nanoTime();
             call(standby, keys).whenComplete((rm2, ex2) -> {
+                stats.recordStandbyBatch(System.nanoTime() - standbyStartNanos);
                 if (ex2 != null) {
                     // 两源都失败：让整批 Future 异常完成。
                     // 刻意不「补空结果」，因为静默补空等于把故障伪装成「该 key 不存在」，
@@ -275,6 +285,53 @@ public class DualLookupFunction extends AsyncLookupFunction {
                 }
             });
         });
+    }
+
+    /**
+     * 输出降级日志（受 {@code lookup.failover.log-interval} 限流）。
+     *
+     * <p>为什么不能像最初那样「每批一条 WARN」？主源长时间故障时，这个日志的量级由
+     * 「批次数」决定而非「记录数」：每分钟 5000 条流量、{@code max-wait=30ms} 下有效批大小
+     * 约 2~3，即每秒约 30 批 → 一天近 300 万行。除了占磁盘，更糟的是 TM 日志频繁滚动，
+     * 会把故障起始时刻的真实上下文冲掉，让排查反而变难。
+     *
+     * <p>限流策略是「首条必打 + 按间隔采样 + 合并计数」：
+     * <ul>
+     *   <li>故障第一批携带完整原因，故障起点不会被漏掉；</li>
+     *   <li>后续每条附带「期间共合并了多少批」，数量信息没有丢失；</li>
+     *   <li>精确计数另有 {@code stats} 的 {@code failover=} 字段兜底。</li>
+     * </ul>
+     *
+     * @param batchSize 本批的 key 数量（用于判断攒批是否生效）
+     * @param cause     主源失败的真实原因（已剥掉 CompletableFuture 包装）
+     */
+    private void warnFailover(int batchSize, Throwable cause) {
+        long merged = failoverGate.visit(System.currentTimeMillis());
+        if (merged == 0L) {
+            LOG.warn("[dual-lookup] 主源 {} 批量查询失败，降级到备源 {}。批大小={}，原因：{}",
+                    cfg.primary, cfg.standby, batchSize, cause.toString());
+        } else if (merged > 0L) {
+            LOG.warn("[dual-lookup] 主源 {} 仍在降级中，降级到备源 {}。批大小={}，原因：{}"
+                            + "（距上次打印又发生 {} 批降级已被合并，需要逐批留痕请将 lookup.failover.log-interval 设为 0）",
+                    cfg.primary, cfg.standby, batchSize, cause.toString(), merged);
+        }
+        // merged < 0：本次被限流，静默丢弃——计数已进 stats，信息不会丢
+    }
+
+    /**
+     * 主源从故障中恢复时补一条 INFO，与上面的降级 WARN 配对。
+     *
+     * <p>只在「确实降级过」时才输出（{@code total() > 0}），因此主源一直健康时完全无噪音。
+     * 有了它，运维不必再靠「WARN 停了没有」去推断恢复时点，也顺手拿到本次故障的降级总量。
+     */
+    private void infoRecovered() {
+        long totalFailovers = failoverGate.total();
+        if (totalFailovers <= 0L) {
+            return;
+        }
+        failoverGate.reset(); // 先清零，再打日志：避免日志线程异常导致状态残留
+        LOG.info("[dual-lookup] 主源 {} 已恢复，重新由主源提供数据（本次故障共降级 {} 批）",
+                cfg.primary, totalFailovers);
     }
 
     /**
@@ -462,5 +519,68 @@ public class DualLookupFunction extends AsyncLookupFunction {
     /** 剥掉 CompletableFuture 包装的 CompletionException，让日志看到真实异常原因 */
     private static Throwable unwrap(Throwable t) {
         return (t instanceof CompletionException && t.getCause() != null) ? t.getCause() : t;
+    }
+
+    /**
+     * 降级日志限流闸门：把「每批一条 WARN」压缩成「每个故障周期首条必打 + 按间隔采样」。
+     *
+     * <p>为什么单独抽出来？因为「限流」这件事的判定是纯时间逻辑，与查询流程无关；
+     * 抽成独立的、不依赖时钟的纯状态机（时刻由调用方传入）后可以直接被单元测试覆盖——
+     * 否则只能靠捕获日志输出来验证，既脆弱又难覆盖边界。
+     *
+     * <p>线程安全：{@code doBatchLookup} 的完成回调可能跑在多个源各自的 IO 线程上，
+     * 并发进入是常态（同时刻可能有多个在途批次），因此所有状态变更都在 {@code synchronized} 内，
+     * 保证计数不丢、不重复。
+     */
+    static final class FailoverLogGate {
+
+        /** 最小输出间隔（毫秒）；&lt;= 0 表示不限流 */
+        private final long intervalMs;
+        /** 是否已经输出过；用它而不是和时间做差，是为了让「首条必打」不依赖时钟初值 */
+        private boolean emitted;
+        /** 上一次实际输出的时刻（毫秒） */
+        private long lastLogMs;
+        /** 距上次输出被抑制（合并）的批数 */
+        private long suppressed;
+        /** 自上次 {@link #reset()} 以来的降级总批数 */
+        private long total;
+
+        FailoverLogGate(long intervalMs) {
+            this.intervalMs = intervalMs;
+            this.lastLogMs = System.currentTimeMillis();
+        }
+
+        /**
+         * 记一次降级，并判定本次是否应输出日志。
+         *
+         * @param nowMs 当前时刻（毫秒）；由调用方传入而不是内部取，便于测试构造时间线
+         * @return {@code >= 0}：应输出，值为「距上次输出被合并的批数」；{@code -1}：本次应抑制
+         */
+        synchronized long visit(long nowMs) {
+            total++;
+            // 首条（!emitted）无条件放行；之后必须距上次输出满一个间隔
+            if (!emitted || nowMs - lastLogMs >= intervalMs) {
+                long merged = suppressed;
+                suppressed = 0L;
+                lastLogMs = nowMs;
+                emitted = true;
+                return merged;
+            }
+            suppressed++;
+            return -1L;
+        }
+
+        /** 自上次 reset 以来的降级总批数：既用于恢复日志汇总，也用于判断当前是否处于故障期 */
+        synchronized long total() {
+            return total;
+        }
+
+        /** 主源恢复后清零，开始统计下一个故障周期 */
+        synchronized void reset() {
+            suppressed = 0L;
+            total = 0L;
+            emitted = false;
+            lastLogMs = System.currentTimeMillis();
+        }
     }
 }

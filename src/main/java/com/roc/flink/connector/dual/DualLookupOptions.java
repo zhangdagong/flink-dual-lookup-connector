@@ -115,14 +115,51 @@ public final class DualLookupOptions {
     // ==================== 可观测性 ====================
 
     /**
-     * 统计日志打印间隔（秒），0 表示关闭。
+     * 统计日志打印间隔（秒），默认 360（6 分钟），0 表示关闭。
      *
-     * <p>用于巡检：能直接看出主源失败数、降级次数、平均批大小，从而判断是主源真的挂了还是阈值配小了。
+     * <p>用于巡检：能直接看出主源失败数、降级次数、平均批大小、各源平均读取耗时，
+     * 从而判断是主源真的挂了、还是阈值配小了、还是单纯流量太低。
+     *
+     * <p><b>每行同时给出两个视角</b>，用 {@code ||} 分隔：{@code window=} 段是「本阶段」增量，
+     * 只描述刚刚过去这一个间隔内发生了什么，因此可以直接读、不需要拿两行做减法；
+     * {@code since-start} 段是「自启动累计」（准确说是本统计实例创建以来，TM 重启后归零），
+     * 用来一眼看到全程总量与长期基线。判断「最近是否变慢」只看 {@code window=} 段——
+     * 累计均值会被历史稀释。内部计数始终是累计值，漏看某行也不会丢数
+     * （下一次输出会把两个区间合并），作业关闭时若还有新活动再补一行累计汇总。
+     *
+     * <p>默认取 6 分钟而不是更短，是因为该日志的价值在于「阶段趋势」而非「实时告警」——
+     * 真正的故障有降级 WARN 即时暴露，统计日志只需足够频繁到能看出趋势即可。
+     * 间隔过短（如 10 秒）时低流量任务每行都只有个位数样本、噪声大且刷屏。
+     * 排查期间可临时调到 10~30 秒。
      */
     public static final ConfigOption<Integer> STATS_LOG_INTERVAL =
             ConfigOptions.key("lookup.stats.log-interval")
                     .intType()
-                    .defaultValue(60);
+                    .defaultValue(360);
+
+    /**
+     * 降级日志的最小输出间隔（秒），默认 10；<b>0 表示不限流</b>（每批降级都打一条，即最原始的行为）。
+     *
+     * <p><b>为什么需要它？</b>主源长时间故障时，「每批一条 WARN」会演变成日志洪峰：
+     * 每分钟 5000 条流量、{@code max-wait=30ms} 下有效批大小约 2~3，即每秒约 30 批——
+     * 一天近 300 万行 WARN。后果不只是占磁盘：TM 日志滚动会把故障发生前后几分钟的
+     * 真实上下文冲掉，反而更难定位根因。
+     *
+     * <p>限流后的行为（三者配合，做到「洪峰被压平、数量不丢失」）：
+     * <ul>
+     *   <li>故障发生的第一批<b>一定</b>打印，含完整异常原因——这是最关键的诊断信息；</li>
+     *   <li>之后每隔该间隔最多打印一条，并附带「期间被合并的批数」；</li>
+     *   <li>主源恢复时补打一条 INFO，汇总本次故障一共降级了多少批，做到有始有终。</li>
+     * </ul>
+     * 精确的逐批次数不会因此丢失：要么在限流日志的合并计数里，要么在
+     * {@link #STATS_LOG_INTERVAL} 统计日志的 {@code failover=} 字段里。
+     *
+     * <p>需要「每一次降级都留痕」（例如做故障复盘、统计精确的失败时序）时把它设为 0。
+     */
+    public static final ConfigOption<Integer> FAILOVER_LOG_INTERVAL =
+            ConfigOptions.key("lookup.failover.log-interval")
+                    .intType()
+                    .defaultValue(10);
 
     // ==================== HBase ====================
 
@@ -313,7 +350,8 @@ public final class DualLookupOptions {
 
         public int batchSize;           // 攒批条数阈值
         public int batchMaxWaitMs;      // 攒批最大等待（毫秒）
-        public int statsLogIntervalSec; // 统计日志间隔（秒），0 关闭
+        public int statsLogIntervalSec; // 统计日志间隔（秒），0 关闭；日志数值为本阶段增量而非累计
+        public int failoverLogIntervalSec; // 降级日志最小间隔（秒），0 不限流
 
         public String hbaseTableName;
         public String hbaseZkQuorum;
@@ -367,6 +405,7 @@ public final class DualLookupOptions {
             cfg.batchSize = c.get(BATCH_SIZE);
             cfg.batchMaxWaitMs = c.get(BATCH_MAX_WAIT);
             cfg.statsLogIntervalSec = c.get(STATS_LOG_INTERVAL);
+            cfg.failoverLogIntervalSec = c.get(FAILOVER_LOG_INTERVAL);
 
             // getOptional(...).orElse(ddlTableName)：表名支持「不配就与 DDL 表名同名」的快捷写法
             cfg.hbaseTableName = c.getOptional(HBASE_TABLE_NAME).orElse(ddlTableName);
@@ -409,6 +448,16 @@ public final class DualLookupOptions {
             // 等待时间为负则等价于「不做时间兜底」，低流量下延迟会无界增长
             if (cfg.batchSize <= 0 || cfg.batchMaxWaitMs < 0) {
                 throw new IllegalArgumentException("[dual-lookup] lookup.batch.size 必须大于 0，batch.max-wait 不能为负");
+            }
+            // 负间隔没有意义（0 已经表达了「不限流」这个语义），拦下来避免被当成「关闭日志」误用
+            if (cfg.failoverLogIntervalSec < 0) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] lookup.failover.log-interval 不能为负，0 表示不限流（每批降级都打印）");
+            }
+            // 同理：负数与 0 在行为上无法区分（都等于关闭打点），与其静默照做，不如在建表阶段拦下
+            if (cfg.statsLogIntervalSec < 0) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] lookup.stats.log-interval 不能为负，0 表示关闭统计日志");
             }
 
             // ---- 超时预算的四条交叉校验 ----

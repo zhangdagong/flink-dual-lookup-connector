@@ -297,7 +297,7 @@ LEFT JOIN dim_mcc FOR SYSTEM_TIME AS OF t1.proc_time AS m2
 
 **Doris 侧更进一步：建池也不连接。** HikariCP 的 `initializationFailTimeout` 被显式设为 `-1`，所以 `open()` 只创建池对象、不做任何连接尝试，连接推迟到首次 `getConnection()`。这一点很关键——HikariCP 默认值 `1` 会让建池时先抢一条连接，而它 4.0.3 的 `checkFailFast()` 在首次建连失败后**无条件 `sleep(1s)`**（实测每次失败的池构造固定耗时 1002ms，同样地址的裸 JDBC 只要 2~107ms）。那 1 秒睡在调用 `open()` 的线程上，也就是 Flink 的异步算子线程；一旦 Doris 是主源且宕机，每个批次都要重试 `open()`，每批白烧 1 秒。关掉之后，连接失败的代价由 `doris.connect.timeout` 封顶（默认 300ms），且 `open()` 只发生一次、池在 Doris 恢复后自行恢复。
 
-> 注意：`lookup.timeout` **不约束建连阶段**，它只作用在 `batchLookupAsync` 上（超时调度器 + `Statement.cancel()`）。所以「建连失败」这类故障的耗时由客户端/连接池参数决定，不要用 `lookup.timeout` 去推算它。HBase 侧 `open()` 是同步的，同样不受 `lookup.timeout` 约束（见 4.2 与第 15 章）。
+> 注意：`lookup.timeout` **不约束建连阶段**，它只作用在 `batchLookupAsync` 上（超时调度器 + `Statement.cancel()`）。所以「建连失败」这类故障的耗时由客户端/连接池参数决定，不要用 `lookup.timeout` 去推算它。HBase 侧 `open()` 是同步的，同样不受 `lookup.timeout` 约束（见 4.2 与第 14 章）。
 
 ### 4.6 防连接/线程打满
 
@@ -326,7 +326,8 @@ Doris 走 JDBC（阻塞 API），若 Doris 出现慢查询而 JDBC 层不先中�
 | `lookup.timeout` | `500` | 单次（批量）查询硬超时（毫秒），超时即判该源故障、转查备源 |
 | `lookup.batch.size` | `50` | 攒批条数阈值：攒满就批量查一次 |
 | `lookup.batch.max-wait` | `5` | 攒批最大等待（毫秒），攒不满时最多等这么久就发 |
-| `lookup.stats.log-interval` | `60` | 统计日志间隔（秒），0 关闭 |
+| `lookup.stats.log-interval` | `360` | 统计日志间隔（秒），默认 6 分钟；0 关闭（连打点线程都不建）。每行同时给出**本阶段**与**自启动累计**两个视角（见第 8 章） |
+| `lookup.failover.log-interval` | `10` | 降级日志最小间隔（秒），**0 = 不限流**（每批降级都打印） |
 
 ### 5.2 HBase 参数（表名缺省取 DDL 表名）
 
@@ -469,32 +470,96 @@ CREATE TABLE dim_account (...) WITH (
 
 ## 8. 可观测性与日志解读
 
-连接器会按 `lookup.stats.log-interval`（默认 60 秒）在 **TaskManager 日志**里打一行累计统计：
+连接器会按 `lookup.stats.log-interval`（默认 360 秒 = 6 分钟）在 **TaskManager 日志**里打一行统计。
+**一行里给出两个视角**，用 `||` 分隔：前半段 `window=` 是**本阶段**，后半段 `since-start` 是**自启动累计**：
 
 ```
-[dual-lookup] table=dim_account totalKeys=1203400 avgBatch=48 avgBatchWithStandby=48 | hbase[batches=25071 keys=1203400 fail=12] doris[batches=12 fail=0] failover=12
+[dual-lookup] table=dim_account window=360s totalKeys=5400 avgBatch=45 avgBatchWithStandby=44 | hbase[batches=120 keys=5400 fail=2 avg=16.5ms] doris[batches=2 fail=0 avg=15.1ms] failover=2 || table=dim_account since-start totalKeys=9900 avgBatch=45 avgBatchWithStandby=44 | hbase[batches=220 keys=9900 fail=2 avg=11.8ms] doris[batches=2 fail=0 avg=15.1ms] failover=2
 ```
 
-逐段解读：
+（真实运行输出，一行太长这里折成两屏：前 6 分钟跑了 5400 个 key、2 批降级；自启动以来累计 9900 个 key。）
+
+两个视角的字段完全一致，只是取值范围不同：
 
 | 字段 | 含义 | 异常信号 |
 |---|---|---|
 | `table` | 维表名（一个作业可能有多张 dual-lookup 表） | — |
-| `totalKeys` | 累计处理的 key 总数（主 + 备） | — |
+| `window` | **只有本阶段段有**：本行覆盖的窗口长度（秒），即距上次打点的真实间隔 | 明显大于配置值 → 打点被负载拖延或日志积压 |
+| `since-start` | 该段的视角标识，意为「本统计实例创建以来」 | 与 `window=` 段对比，即可看出「总量」与「当前趋势」的差别 |
+| `totalKeys` | 该视角下提交给主源的 key 数（降级不重复计） | — |
 | `avgBatch` | 平均批大小（**只用主源批次做分母**） | 长期接近 1 → 攒批没生效，检查流量与 `lookup.batch.size` |
-| `avgBatchWithStandby` | 含备源批次的平均批大小 | 明显小于 `avgBatch` → 降级期间同一批 key 被主备各计一次，说明降级频繁 |
-| `hbase[batches= keys= fail=]` | 主源批次数 / key 数 / 失败数 | `fail` 持续增长 → 主源确实有问题，或 `lookup.timeout` 配小了 |
-| `doris[batches= fail=]` | 备源批次数 / 失败数 | `batches` > 0 说明发生了降级；`fail` > 0 说明**两源同时异常，需立即介入** |
-| `failover` | 降级总次数 | 持续增长且远大于 0 → 主源不可用或阈值不合理 |
+| `avgBatchWithStandby` | 含备源批次的平均批大小 | 明显小于 `avgBatch` → 降级期间同一批 key 被主备各查一次，说明降级频繁 |
+| `hbase[batches= keys= fail= avg=]` | 主源：批次数 / key 数 / 失败数 / **平均单批耗时** | `fail` 持续增长 → 主源确实有问题或 `lookup.timeout` 配小了；`avg` 持续上升 → 主源正在变慢（此时 `fail` 可能还是 0） |
+| `doris[batches= fail= avg=]` | 备源：批次数 / 失败数 / 平均单批耗时 | `batches` > 0 说明发生了降级；`fail` > 0 说明**两源同时异常，需立即介入** |
+| `failover` | 该视角下的降级次数 | 持续大于 0 → 主源不可用或阈值不合理 |
 
-**统计是累计值（非窗口值）**，两次日志相减即可算出区间指标，因此漏看几行日志也能通过求差还原因果。
+五个容易看错的点：
+
+1. **两个视角回答两个不同问题**：`window=` 段看「最近这段时间是否变慢/变差」，`since-start` 段看「全程总量与长期基线」。**判断「现在有没有问题」只看前半段**——累计均值会被历史稀释，主源刚坏 10 分钟时 `since-start` 的 `avg` 几乎不会动。
+2. **`since-start` 是「本统计实例创建以来」**：TaskManager 重启（故障恢复、扩缩容、升级）后计数从 0 重新开始，它不等于作业生命周期总量。要跨重启的长期量级，需按 TM 日志分段累加或另接 Flink 指标。
+3. **平均耗时的口径**：① 失败批次的耗时也计入，否则「主源正在变慢、开始不断超时」这段恶化过程会被完全掩盖；② 备源耗时从**真正发起备源查询**那一刻起算，不含前面等主源超时的时间——否则主源越慢备源的数字越难看，指标就失去了诊断价值。
+4. **无样本时显示 `-`**（如 `doris[batches=0 fail=0 avg=-]`），不是 `0`——`0ms` 会被误读成「秒回」。
+5. **为什么默认 6 分钟**：这条日志的价值在于**趋势**而非实时告警——真正的故障有降级 WARN 即时暴露。间隔太短（如 10 秒）时低流量任务每行只有个位数样本，噪声大且刷屏；排查期间可临时调到 10~30 秒。
+
+**为什么两个视角要挤在同一行**，而不是各打一行：① TM 日志是多线程并发写的，两行之间可能插进别的子任务输出，靠时间戳配对容易错位；② 同一行里的两段来自**同一份计数快照**（见 `LookupStats.Sample`），因此 `本行阶段 + 此前累计 = 本行累计` 恒成立，可以直接做守恒校验；若两段各自去读原子变量，就会出现「累计比阶段少 3 批」这类自相矛盾的数字，让人去查一个并不存在的 bug。
 
 另外注意区分两类日志：
 
-- `LOG.warn("[dual-lookup] 主源 X 批量查询失败，降级到备源 Y。批大小=N，原因：...")` —— 每次降级打一条，含具体异常原因，是排查主源问题的第一手材料。
+- **降级 WARN**：`[dual-lookup] 主源 X 批量查询失败，降级到备源 Y。批大小=N，原因：...`
+  含具体异常原因，是排查主源问题的第一手材料。这条日志**按 `lookup.failover.log-interval`（默认 10 秒）限流**（见下方「日志洪峰」）。
+- `LOG.info("[dual-lookup] 主源 X 已恢复，重新由主源提供数据（本次故障共降级 N 批）")` —— 主源从故障中恢复时补一条，与上面的 WARN 配对，不必再靠「WARN 停了没有」推断恢复时点。
 - `LOG.info("[dual-lookup] HBase reader opened, ...")` / `Doris reader opened, ...` —— 每个并发子任务各打一次，出现次数 = 算子并行度。若某个子任务一直没打，说明它从未成功建连。
 
-> 为什么不用 Flink MetricGroup？异步 Lookup Function 不是 `RichFunction`，拿不到 `RuntimeContext`。定时日志在巡检场景也更直观。
+### 8.1 日志洪峰：为什么降级日志要限流
+
+主源长时间故障时，降级日志的量级由**批次数**决定，而不是记录数。以每分钟 5000 条流量、`lookup.batch.max-wait=30ms` 为例：
+
+| 指标 | 数值 |
+|---|---|
+| 流量 | 5000/min ≈ 83 条/秒 |
+| 有效批大小（83 × 0.03） | ≈ 2.5 条/批 |
+| 降级批次 | ≈ 33 批/秒 |
+| 不限流时的 WARN 量 | ≈ 33 行/秒 → **约 285 万行/天** |
+
+后果不只是占磁盘——TM 日志频繁滚动会把**故障起始时刻那几行**冲掉，反而更难定位根因。
+
+限流策略是「**首条必打 + 按间隔采样 + 合并计数 + 恢复补打**」：
+
+```
+t=0.00s  主源 hbase 批量查询失败，降级到备源 doris。批大小=3，原因：TimeoutException: HBase lookup timeout after 500ms     ← 首条必打
+          （0.03s ~ 10.00s 之间约 330 批降级，静默）
+t=10.03s 主源 hbase 仍在降级中，降级到备源 doris。批大小=3，原因：...（距上次打印又发生 330 批降级已被合并）              ← 采样一条
+t=25.10s 主源 hbase 已恢复，重新由主源提供数据（本次故障共降级 830 批）                                                ← 恢复信号
+```
+
+三点保证「洪峰被压平，但数量不丢」：故障起点必留痕、每条日志自带被合并的批数、精确计数另有统计日志的 `failover=` 字段兜底（`window=` 段给本阶段降级次数，`since-start` 段给累计降级次数，见第 8 章）。
+
+需要每一次降级都留痕（故障复盘、精确排失败时序）时，把 `lookup.failover.log-interval` 设为 `0` 即可回到逐批打印。该值不允许为负——0 已经表达了「不限流」，负数会在建表阶段被拦下。
+
+### 8.2 跑几个月的资源开销：可以忽略，但有三处要留意
+
+统计是「**每 6 分钟打一行**」而不是「每批打一行」，成本量级由此决定：
+
+| 维度 | 量级 | 说明 |
+|---|---|---|
+| 打点 CPU | 每 6 分钟几十微秒 | 单守护线程被唤醒一次：9 次原子读 + 一次字符串格式化 + 一次日志写入，占整个 6 分钟窗口的比例 **< 0.001%** |
+| 打点线程 | 每算子实例 1 个 | 守护线程；`lookup.stats.log-interval=0` 时**连线程都不创建** |
+| 埋点 CPU | 每批 4 次原子自增 | 无争用时约 10~20ns/次 → 每批 < 0.1μs。而每批本身至少一次 HBase RPC 或 JDBC 查询（毫秒级），占比 **< 0.01%** |
+| 常驻内存 | **固定约 200 字节** | 9 个 `AtomicLong`，无集合、无缓存、无队列——**跑一个月和跑一年的内存占用完全一样**，不存在随时间增长的状态 |
+| 日志体积 | 约 240 行/天/子任务 | 默认 360s 一行，每行约 320 字节 → 约 77KB/天；一年约 28MB，8 并发约 224MB/年 |
+| 计数器溢出 | **不会**（理论 29 年起） | 见下 |
+
+**计数器不会溢出**：9 个计数器都是 `long`（上限 9.22×10^18）。
+① key 数按 5000 条/分钟算，一年约 2.6×10^9，要溢出需约 5000 万年；
+② 唯一相对接近上限的是**纳秒级累计耗时**：只有在「1000 批/秒 × 10ms/批」这种极端吞吐下**连续跑 29 年**才会触及 `long` 上限——而单子任务 1000 批/秒的 HBase RPC 吞吐本身就不现实（`lookup.timeout` 默认 500ms 也意味着单批更慢）。结论：跑几个月连零头都用不到。
+
+三处**真正需要留意**的地方：
+
+1. **日志体积与滚动策略**（全文唯一需要运维动作的点）。默认间隔下每子任务约 77KB/天，本身毫无压力；Flink 1.18 的 TM 日志 appender 默认就是 `SizeBasedTriggeringPolicy=100MB` + `DefaultRolloverStrategy max=10`（即最多约 1GB，位于 `$FLINK_HOME/conf/log4j2.properties`），不额外配置也不会失控。若嫌噪音大，把 `lookup.stats.log-interval` 调到 `1800`（半小时一行），体积再降 5 倍。
+2. **打点任务异常停摆**（代码里已兜底）。`scheduleAtFixedRate` 有个不显眼的坑：任务一旦抛出未捕获异常，**后续调度会被静默取消**——不打印、不重试，统计日志就此永久消失而没人发现。`LookupStats.logSnapshotSafely()` 用 `try/catch (Throwable)` 兜住，并只在首次失败时告警一次：统计只是可观测性手段，不能因为一次格式化问题把自己打死。
+3. **`since-start` 会被历史稀释、且随 TM 重启归零**（解释性，不是故障）。因此「最近是否变慢」永远看 `window=` 段；要跨重启的长期曲线，应另接 Flink 指标系统。
+
+> **为什么不用 `LongAdder`、也不进 `MetricGroup`**：`LongAdder` 在高争用下更快，但读时要 `sum()`、拿不到精确一致快照，会让「本行阶段 + 此前累计 = 本行累计」的守恒校验变模糊；而本场景的争用极低（埋点来自攒批线程与源侧回调，批次速率受 RPC 吞吐限制），换 `LongAdder` 省下的纳秒级开销换不来任何收益。Flink `MetricGroup` 需要 `RuntimeContext`，而异步 Lookup Function 不是 `RichFunction`、拿不到——这正是本类存在的根本原因；若确实要进指标系统，得把装配改成 `RichAsyncFunction` 形态，属于装配层取舍，当前日志方式已覆盖巡检需求。
 
 ---
 
@@ -627,7 +692,7 @@ mysql -h 192.168.214.128 -P 9030 -uroot -e "shutdown"   # 或直接停 FE/BE
 | TaskManager 报连接数过多 | 并行度 × `doris.pool.size` 超出 Doris 承载 | 降低 `doris.pool.size` 或算子并行度 |
 | 集群 lib 里已有 HBase 但报 `NoSuchMethodError` | 集群 HBase 版本与 `hbase-shaded-client` 不一致 | 调整 pom 里 `hbase.version` 与集群对齐后重新打包 |
 | Doris 宕机，但作业毫无反应（备源场景） | 备源只在需要降级时才被建连，**平时不做健康检查** | 属预期行为；但这期间容错能力为 0，建议对 Doris 单独做可用性监控，别等 HBase 出事才发现 |
-| Doris 当主源且宕机时，WARN 每批刷一条、吞吐下降 | 每次批次都会重试死掉的主源（当前没有熔断器） | 属预期；短期可把 `doris.connect.timeout` 压到 250ms（HikariCP 下限）限损，长期见第 15 章熔断器 |
+| Doris 当主源且宕机时，每批都要重试死掉的主源、吞吐下降 | 当前没有熔断器：`open()` 失败或查询超时后会持续重试（降级 WARN 本身已按 `lookup.failover.log-interval` 限流，日志不再是问题） | 属预期；短期可把 `doris.connect.timeout` 压到 250ms（HikariCP 下限）限损，长期见第 14 章熔断器 |
 
 ---
 
@@ -641,21 +706,25 @@ src/main/java/com/roc/flink/connector/dual/
 ├── HBaseLookupReader.java             # HBase 异步查询 + 建连预热 region location + 超时
 ├── DorisLookupReader.java             # Doris JDBC + 连接池 + 攒批 SQL + 中断后端
 ├── DualLookupFunction.java            # 异步 Lookup Function（攒批 + 主备路由核心）
-├── LookupStats.java                   # 运行期统计（累计计数 + 定时打一行日志）
+├── LookupStats.java                   # 运行期统计（一次打点两个视角：本阶段增量 + 自启动累计 / 各源平均耗时）
 ├── DualLookupTableSource.java         # LookupTableSource（装配 Reader 与 Function）
 ├── DualLookupTableSourceFactory.java  # SPI 工厂（配置校验 + schema 提取）
 └── resources/META-INF/services/org.apache.flink.table.factories.Factory
                                        # SPI 注册文件，内容为实现类全限定名
 
 src/test/java/com/roc/flink/connector/dual/
-├── DualLookupOptionsTest.java         # 配置解析 + 交叉校验（10 个用例）
+├── DualLookupOptionsTest.java         # 配置解析 + 交叉校验 + 日志间隔取值（12 个用例）
 ├── DorisLookupReaderTest.java         # 伪造 JDBC 对象：重复主键分发 / 超时清理 / 队列满拒绝 /
-│                                      #   byte[]·BigDecimal 主键按内容匹配 / 超时任务取消（8 个）
+│                                      #   byte[]·BigDecimal 主键按内容匹配 / 超时任务取消 /
+│                                      #   Doris 宕机时 open() 不被建池自检拖住（9 个）
 ├── DualLookupFunctionTest.java        # 攒批时序（含残留定时器回归）/ 主备降级 / 空结果不降级 /
-│                                      #   关闭补空 / close 后降级链不重新建连（8 个）
+│                                      #   关闭补空 / close 后降级链不重新建连 / 降级日志限流闸门 /
+│                                      #   各源耗时埋点接线（13 个）
 ├── HBaseRowKeyEncodingTest.java       # rowkey 两种编码模式的字节结果与往返还原（5 个）
 ├── HBaseLookupReaderTest.java         # 已完成查询取消超时任务、调度器队列清空（1 个）
-└── RowDataConverterTest.java          # 全类型双向转换 / 元字段 / 大小写兼容 / 时间多形态（7 个）
+├── RowDataConverterTest.java          # 全类型双向转换 / 元字段 / 大小写兼容 / 时间多形态（7 个）
+└── LookupStatsTest.java               # 阶段值而非累计 / 每行都带累计视角且守恒 / 各源平均耗时 /
+                                       #   无样本显示 - / 累计汇总 / interval=0 不建线程（6 个）
 ```
 
 各层的职责边界（读代码时按这个映射找）：
@@ -673,9 +742,12 @@ src/test/java/com/roc/flink/connector/dual/
 
 **「两源可互换」是怎么保证的**：两个 Reader 都把结果统一成 `Map<列名小写, Java对象>`，再由 `RowDataConverter` 按 DDL 类型转成 `RowData`。只要两源表结构与 DDL 一致，切换后输出完全等价。列名统一转小写、元字段走独立内部键，都是为这一点服务的。
 
-**单元测试**：`mvn test` 跑全部 40 个用例，**不依赖任何外部服务**——用伪造的 `HikariDataSource` 子类 + JDBC `Proxy` 对象、以及假的 `LookupReader` 驱动真实代码，因此可以直接放进 CI 作为发布门槛。覆盖的关键行为包括：批内重复主键分发、超时后打断后端、线程池队列满时降级、Doris 宕机时 open() 不被建池自检拖住、残留定时器不冲下一批、**空结果不降级（核心语义）**、两源失败不补空、rowkey 编码往返、byte[]/BigDecimal 主键按内容匹配、已完成查询取消超时任务、close 后降级链不重新建连、全类型双向转换。
+**单元测试**：`mvn test` 跑全部 53 个用例，**不依赖任何外部服务**——用伪造的 `HikariDataSource` 子类 + JDBC `Proxy` 对象、以及假的 `LookupReader` 驱动真实代码，因此可以直接放进 CI 作为发布门槛。覆盖的关键行为包括：批内重复主键分发、超时后打断后端、线程池队列满时降级、Doris 宕机时 open() 不被建池自检拖住、残留定时器不冲下一批、**空结果不降级（核心语义）**、两源失败不补空、rowkey 编码往返、byte[]/BigDecimal 主键按内容匹配、已完成查询取消超时任务、close 后降级链不重新建连、降级日志首条必打与限流、统计输出同时给出阶段值与自启动累计（且两者守恒）、各源耗时独立、全类型双向转换。
 
 > 本机没有 mvn 时，可改用仓库根目录的 `run_units.py`（IDEA 自带 JBR 编译 + `JUnitCore` 运行），效果相同。
+
+> 各轮代码评审发现的问题、修复方案与实测对比，见根目录 `CODE_REVIEW.md`（累计 19 项，均已修复并固化为回归用例）。
+> 端到端测试方案见 `TEST_PLAN.md` + `sql/e2e_test.sql` + `sql/gen_test_data.py`。
 
 ---
 
@@ -689,6 +761,8 @@ src/test/java/com/roc/flink/connector/dual/
 | `lookup.timeout` | 必须 > 0（否则降级永不触发） |
 | `lookup.batch.size` | 必须 > 0（否则批永远发不出去） |
 | `lookup.batch.max-wait` | 不能为负（否则失去时间兜底） |
+| `lookup.failover.log-interval` | 不能为负（`0` 已表达「不限流」，负数无意义，避免被当成「关闭日志」误用） |
+| `lookup.stats.log-interval` | 不能为负（负数与 `0` 行为上无法区分，与其静默照做不如建表期报错） |
 | `doris.pool.min-idle` | 不能大于 `doris.pool.size`（HikariCP 硬约束） |
 | `doris.pool.validation-timeout` | 不能大于 `doris.connect.timeout`（HikariCP 硬约束） |
 | `doris.connect.timeout` | 必须小于 `lookup.timeout`（备源无处再降，池满时业务层先超时会让整批失败） |
@@ -724,7 +798,7 @@ src/test/java/com/roc/flink/connector/dual/
 
 ---
 
-## 15. 已知限制与演进方向
+## 14. 已知限制与演进方向
 
 **当前限制**：
 
@@ -739,6 +813,6 @@ src/test/java/com/roc/flink/connector/dual/
 1. **熔断器**：主源连续失败 N 次后直接跳过主源一段时间，解决「主源整体宕机时吞吐被超时拖死」的问题。
 2. **主备结果对账**：利用 `lookup_source` 元字段做双写抽样比对，用于数据迁移期的正确性验证。
 3. **更多源**：抽象层已就绪（`LookupReader` 接口），新增 Redis / MySQL 源只需实现该接口 + 在 Factory 里登记。
-4. **Flink Metric 上报**：让统计接入 Flink 的指标体系，便于统一监控告警。
+4. **Flink Metric 上报**：让统计接入 Flink 的指标体系，便于统一监控告警。前提是把装配改成 `RichAsyncFunction` 形态——异步 Lookup Function 不是 `RichFunction`、拿不到 `RuntimeContext`（这也是 `LookupStats` 存在的根本原因）。在此之前定时日志已覆盖巡检需求，其长期开销评估见第 8.2 节。
 
 ---
