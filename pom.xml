@@ -25,6 +25,7 @@
         <!-- HikariCP 4.0.3 是兼容 Java 8 的最后一代；5.x 需要 Java 11+ -->
         <hikari.version>4.0.3</hikari.version>
         <slf4j.version>1.7.36</slf4j.version>
+        <junit.version>4.13.2</junit.version>
     </properties>
 
     <dependencies>
@@ -62,6 +63,9 @@
         </dependency>
 
         <!-- ================= 以下打进 fat jar（compile scope） ================= -->
+        <!-- hbase-shaded-client 只 relocate 了第三方依赖（protobuf/guava/zookeeper 等），
+             org.apache.hadoop.* 保持原包名，因此必须在 shade 阶段显式排除（见下方 artifactSet），
+             改由 Flink 集群提供。 -->
         <dependency>
             <groupId>org.apache.hbase</groupId>
             <artifactId>hbase-shaded-client</artifactId>
@@ -77,6 +81,14 @@
             <artifactId>HikariCP</artifactId>
             <version>${hikari.version}</version>
         </dependency>
+
+        <!-- ================= 测试（test scope，不会进 fat jar） ================= -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -91,6 +103,13 @@
                     <target>1.8</target>
                     <encoding>UTF-8</encoding>
                 </configuration>
+            </plugin>
+
+            <!-- 固定 surefire 版本，避免不同 Maven 默认版本行为不一致 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.4</version>
             </plugin>
 
             <!-- 把 HBase 客户端 / MySQL 驱动 / HikariCP 一起打进单个 fat jar -->
@@ -113,6 +132,15 @@
                                     <exclude>org.slf4j:*</exclude>
                                     <exclude>org.apache.logging.log4j:*</exclude>
                                     <exclude>commons-logging:commons-logging</exclude>
+                                    <!-- Hadoop 自身的类不会被 hbase-shaded-client relocate，
+                                         默认会整个打进 fat jar（实测 3 万余个类、约 72MB）。
+                                         多带一份 hadoop-common 与 Flink lib 下的版本冲突时，
+                                         典型症状是 NoSuchMethodError / ClassCastException，
+                                         且只在特定代码路径上偶发。这里排除、改由集群提供。
+
+                                         ⚠️ 若你的 Flink 是 hadoop-free 发行版（lib 下没有
+                                         hadoop-common），删掉下面这一行即可恢复「自带 hadoop」的打包方式。 -->
+                                    <exclude>org.apache.hadoop:*</exclude>
                                 </excludes>
                             </artifactSet>
                             <filters>
