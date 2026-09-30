@@ -445,7 +445,7 @@ mvn clean package # 打 fat jar
 
 - **熔断器**：主源持续故障时不做熔断，每批仍会重试一次（代价已被 `doris.connect.timeout` / `lookup.timeout` 封顶）；
 - **监听主源恢复并自动重连**：当前 HBase 侧旧连接失效后需重启作业（README 第 14 章、TEST_PLAN 案例 15）；
-- **Flink Metric 上报**：异步 Lookup Function 不是 `RichFunction`，拿不到 `RuntimeContext`，暂用定时日志；
+- **Flink Metric 上报**：`open(FunctionContext)` 的 `FunctionContext.getMetricGroup()` 即本子任务 metric group，可直接注册 `Counter`/`Gauge`（无需改成 `RichAsyncFunction`），当前暂只用定时日志；
 - **Doris 侧查询缓存**：官方 Doris Connector 的 lookup join 三项优化中，本项目已实现异步与攒批，尚缺缓存。
 
 ---

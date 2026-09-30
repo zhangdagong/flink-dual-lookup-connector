@@ -559,7 +559,9 @@ t=25.10s 主源 hbase 已恢复，重新由主源提供数据（本次故障共�
 2. **打点任务异常停摆**（代码里已兜底）。`scheduleAtFixedRate` 有个不显眼的坑：任务一旦抛出未捕获异常，**后续调度会被静默取消**——不打印、不重试，统计日志就此永久消失而没人发现。`LookupStats.logSnapshotSafely()` 用 `try/catch (Throwable)` 兜住，并只在首次失败时告警一次：统计只是可观测性手段，不能因为一次格式化问题把自己打死。
 3. **`since-start` 会被历史稀释、且随 TM 重启归零**（解释性，不是故障）。因此「最近是否变慢」永远看 `window=` 段；要跨重启的长期曲线，应另接 Flink 指标系统。
 
-> **为什么不用 `LongAdder`、也不进 `MetricGroup`**：`LongAdder` 在高争用下更快，但读时要 `sum()`、拿不到精确一致快照，会让「本行阶段 + 此前累计 = 本行累计」的守恒校验变模糊；而本场景的争用极低（埋点来自攒批线程与源侧回调，批次速率受 RPC 吞吐限制），换 `LongAdder` 省下的纳秒级开销换不来任何收益。Flink `MetricGroup` 需要 `RuntimeContext`，而异步 Lookup Function 不是 `RichFunction`、拿不到——这正是本类存在的根本原因；若确实要进指标系统，得把装配改成 `RichAsyncFunction` 形态，属于装配层取舍，当前日志方式已覆盖巡检需求。
+> **关于 `LongAdder` 与 `MetricGroup`**：`LongAdder` 在高争用下更快，但读时要 `sum()`、拿不到精确一致快照，会让「本行阶段 + 此前累计 = 本行累计」的守恒校验变模糊；而本场景的争用极低（埋点来自攒批线程与源侧回调，批次速率受 RPC 吞吐限制），换 `LongAdder` 省下的纳秒级开销换不来任何收益。
+>
+> Flink 指标**其实是可以接的**：异步 Lookup Function 虽然拿不到 `RuntimeContext`，但它的 `open(FunctionContext)` 拿到的 `FunctionContext.getMetricGroup()` 返回的正是**本并行子任务的 metric group**（已核对 Flink 1.18 `flink-table-common` 源码），注册 `Counter` / `Gauge` 完全可行，并不需要改成 `RichAsyncFunction`。之所以仍用日志：① 巡检与复盘要的是「一行看全 + 可直接 grep + 能带文本字段（失败原因、本阶段/累计两个视角）」，`Gauge` 只给单个数值；② `FunctionContext` 在常量折叠等本地执行路径上拿到的是**未注册**的 metric group（注册不生效且只打一条 WARN），两条路径行为不一致，日志则始终一致。要接指标系统见第 14 章演进方向。
 
 ---
 
@@ -813,6 +815,6 @@ src/test/java/com/roc/flink/connector/dual/
 1. **熔断器**：主源连续失败 N 次后直接跳过主源一段时间，解决「主源整体宕机时吞吐被超时拖死」的问题。
 2. **主备结果对账**：利用 `lookup_source` 元字段做双写抽样比对，用于数据迁移期的正确性验证。
 3. **更多源**：抽象层已就绪（`LookupReader` 接口），新增 Redis / MySQL 源只需实现该接口 + 在 Factory 里登记。
-4. **Flink Metric 上报**：让统计接入 Flink 的指标体系，便于统一监控告警。前提是把装配改成 `RichAsyncFunction` 形态——异步 Lookup Function 不是 `RichFunction`、拿不到 `RuntimeContext`（这也是 `LookupStats` 存在的根本原因）。在此之前定时日志已覆盖巡检需求，其长期开销评估见第 8.2 节。
+4. **Flink Metric 上报**：让统计接入 Flink 的指标体系（WebUI 可视化、可接告警）。路径比想象中短——不需要改成 `RichAsyncFunction`，`open(FunctionContext)` 里的 `FunctionContext.getMetricGroup()` 就是本并行子任务的 metric group，直接在 `LookupStats.start()` 时注册 `Counter` / `Gauge` 即可；代价是两套出口要各自保证不重复统计。当前定时日志已覆盖巡检需求，其长期开销评估见第 8.2 节。
 
 ---
