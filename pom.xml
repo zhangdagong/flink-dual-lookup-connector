@@ -7,21 +7,41 @@
 
     <groupId>com.roc</groupId>
     <artifactId>flink-dual-lookup-connector</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <name>Flink Dual Lookup Connector (HBase / Doris 双源容错)</name>
 
+    <!--
+      ============================ 依赖版本策略 ============================
+      本连接器的依赖只有一个原则：**Hadoop 与 Flink 一律由集群提供，fat jar 里只带 HBase 客户端、
+      Doris 驱动和连接池**。理由见 README「2. 环境要求」与「11. 常见问题排查」，这里只强调结论：
+
+      1) hadoop-common / hadoop-auth 用 provided：运行时必须与集群完全一致（当前生产 Hadoop 3.1.3）。
+         一旦打进 jar，就会和集群的 Hadoop 形成「两个世代」——历史上正是这样撞出了
+             NoSuchMethodError: org.apache.hadoop.fs.FsTracer.get(...)Lorg/apache/htrace/core/Tracer;
+      2) HBase 必须用 hbase-shaded-client-**byo-hadoop**，不能用 hbase-shaded-client：
+         后者的 manifest 明确写着 "with Hadoop bundled"，会把整套 hadoop + htrace 塞进 jar，
+         用 -hadoop3 版本时带的是更新世代的 Hadoop（FsTracer 返回 org.apache.hadoop.tracing.Tracer），
+         与生产 Hadoop 3.1.3（htrace 世代）混用必然 NoSuchMethodError；
+      3) 因此 HBase 版本与 Hadoop 版本必须成对出现：HBase 2.2.7 ↔ Hadoop 3.1.3。
+         换 HBase 版本时，务必同步确认它编译时用的 Hadoop 世代。
+    -->
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
 
+        <!-- Flink：集群已提供，不打包 -->
         <flink.version>1.18.1</flink.version>
-        <!-- 2.6.2-hadoop3 匹配 Hadoop 3.x；若集群用 Hadoop 2.x 请改用 2.6.2 -->
-        <hbase.version>2.6.2-hadoop3</hbase.version>
-        <mysql.version>8.3.0</mysql.version>
+
+        <!-- 生产集群版本：HBase 2.2.7 + Hadoop 3.1.3（必须成对升级） -->
+        <hbase.version>2.2.7</hbase.version>
+        <hadoop.version>3.1.3</hadoop.version>
+
+        <!-- Connector/J 8.0.x 是 Java 8 上验证最充分的一代；Doris 走 MySQL 协议，兼容 8.0 客户端 -->
+        <mysql.version>8.0.33</mysql.version>
         <!-- HikariCP 4.0.3 是兼容 Java 8 的最后一代；5.x 需要 Java 11+ -->
         <hikari.version>4.0.3</hikari.version>
         <slf4j.version>1.7.36</slf4j.version>
@@ -30,6 +50,10 @@
 
     <dependencies>
         <!-- ================= Flink：集群已提供，不打包 ================= -->
+        <!-- 主代码实际只用到这两个：
+             flink-core          -> ConfigOption / ReadableConfig / RowKind
+             flink-table-common  -> LogicalType / RowData / GenericRowData / FactoryUtil / AsyncLookupFunction
+             其余（table-runtime / streaming-java）已确认没有引用，去掉以缩小依赖面。 -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-core</artifactId>
@@ -42,18 +66,23 @@
             <version>${flink.version}</version>
             <scope>provided</scope>
         </dependency>
+
+        <!-- ================= Hadoop：集群已提供，不打包 ================= -->
+        <!-- 只提供编译期符号（Configuration / UserGroupInformation）。
+             运行期一律用集群 lib 下那一份，保证 FsTracer、htrace、UGI 等与集群同世代。 -->
         <dependency>
-            <groupId>org.apache.flink</groupId>
-            <artifactId>flink-table-runtime</artifactId>
-            <version>${flink.version}</version>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <version>${hadoop.version}</version>
             <scope>provided</scope>
         </dependency>
         <dependency>
-            <groupId>org.apache.flink</groupId>
-            <artifactId>flink-streaming-java</artifactId>
-            <version>${flink.version}</version>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-auth</artifactId>
+            <version>${hadoop.version}</version>
             <scope>provided</scope>
         </dependency>
+
         <!-- 日志门面：编译用，运行时由 Flink 提供，不打包 -->
         <dependency>
             <groupId>org.slf4j</groupId>
@@ -62,15 +91,56 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- ================= 以下打进 fat jar（compile scope） ================= -->
-        <!-- hbase-shaded-client 只 relocate 了第三方依赖（protobuf/guava/zookeeper 等），
-             org.apache.hadoop.* 保持原包名，因此必须在 shade 阶段显式排除（见下方 artifactSet），
-             改由 Flink 集群提供。 -->
+        <!-- ================= 以下才进 fat jar（compile scope） ================= -->
+
+        <!--
+          HBase 客户端：byo-hadoop = bring your own Hadoop，jar 内不含任何 org.apache.hadoop.*
+          与 org.apache.htrace.*（HBase 自己的 shade 配置就把这两者排除了），因此不会覆盖集群的 Hadoop。
+
+          ⚠️ 不要改回 hbase-shaded-client：它把 Hadoop 一起打包了（manifest: "with Hadoop bundled"），
+             正是 NoSuchMethodError: FsTracer.get 的根因。
+
+          下面的 exclusions 是 HBase 2.2.7 POM 里声明的 compile 依赖，它们只服务于 HBase 的
+          shade 过程，运行期应由集群提供；留在 classpath 上只会制造冲突：
+          - log4j:log4j 1.2.17 + slf4j-log4j12：Flink 用 log4j2，混入 log4j1 会抢 slf4j 绑定
+          - htrace-core4：由 Hadoop 3.1.3 自带（4.1.0-incubating），版本不一致会引发 ClassCastException
+          - commons-logging：Flink 已排除，容易与 jcl-over-slf4j 冲突
+        -->
         <dependency>
             <groupId>org.apache.hbase</groupId>
-            <artifactId>hbase-shaded-client</artifactId>
+            <artifactId>hbase-shaded-client-byo-hadoop</artifactId>
             <version>${hbase.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>log4j</groupId>
+                    <artifactId>log4j</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+                <!-- htrace 不打进 jar：Hadoop 的 FsTracer 返回的就是 org.apache.htrace.core.Tracer，
+                     必须与集群里那一份是同一个类；Hadoop 3.1.3 的 share/hadoop/common/lib 自带
+                     htrace-core4-4.1.0-incubating。若集群是 hadoop-free，请把该 jar 补进 lib/。 -->
+                <exclusion>
+                    <groupId>org.apache.htrace</groupId>
+                    <artifactId>htrace-core4</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.hbase</groupId>
+                    <artifactId>hbase-resource-bundle</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>com.github.stephenc.findbugs</groupId>
+                    <artifactId>findbugs-annotations</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
+
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
@@ -127,27 +197,48 @@
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <artifactSet>
                                 <excludes>
-                                    <!-- Flink 集群自带，绝不打入 -->
+                                    <!-- Flink / 日志 / Hadoop：集群自带，绝不打入 -->
                                     <exclude>org.apache.flink:*</exclude>
+                                    <exclude>org.apache.hadoop:*</exclude>
+                                    <exclude>org.apache.htrace:*</exclude>
                                     <exclude>org.slf4j:*</exclude>
                                     <exclude>org.apache.logging.log4j:*</exclude>
                                     <exclude>commons-logging:commons-logging</exclude>
-                                    <!-- Hadoop 自身的类不会被 hbase-shaded-client relocate，
-                                         默认会整个打进 fat jar（实测 3 万余个类、约 72MB）。
-                                         多带一份 hadoop-common 与 Flink lib 下的版本冲突时，
-                                         典型症状是 NoSuchMethodError / ClassCastException，
-                                         且只在特定代码路径上偶发。这里排除、改由集群提供。
-
-                                         ⚠️ 若你的 Flink 是 hadoop-free 发行版（lib 下没有
-                                         hadoop-common），删掉下面这一行即可恢复「自带 hadoop」的打包方式。 -->
-                                    <exclude>org.apache.hadoop:*</exclude>
+                                    <exclude>log4j:*</exclude>
                                 </excludes>
                             </artifactSet>
                             <filters>
                                 <filter>
                                     <artifact>*:*</artifact>
                                     <excludes>
-                                        <!-- 去掉各 jar 的签名，否则合并后报 SecurityException -->
+                                        <!--
+                                          兜底：即使将来有人误把 hbase-shaded-client（带 Hadoop 的版本）换回来，
+                                          这里也会把 Hadoop 自身的包剔除，只保留 org.apache.hadoop.hbase.*。
+                                          注意不能简单写 org/apache/hadoop/**——HBase 的类就在
+                                          org/apache/hadoop/hbase/ 下，会被一并删掉。
+                                          真正的验收是 `jar tf | grep` 自查产物里没有 FsTracer 等 Hadoop 类。
+                                        -->
+                                        <exclude>org/apache/hadoop/conf/**</exclude>
+                                        <exclude>org/apache/hadoop/crypto/**</exclude>
+                                        <exclude>org/apache/hadoop/fs/**</exclude>
+                                        <exclude>org/apache/hadoop/ha/**</exclude>
+                                        <exclude>org/apache/hadoop/http/**</exclude>
+                                        <exclude>org/apache/hadoop/io/**</exclude>
+                                        <exclude>org/apache/hadoop/ipc/**</exclude>
+                                        <exclude>org/apache/hadoop/jmx/**</exclude>
+                                        <exclude>org/apache/hadoop/log/**</exclude>
+                                        <exclude>org/apache/hadoop/metrics2/**</exclude>
+                                        <exclude>org/apache/hadoop/net/**</exclude>
+                                        <exclude>org/apache/hadoop/oncrpc/**</exclude>
+                                        <exclude>org/apache/hadoop/security/**</exclude>
+                                        <exclude>org/apache/hadoop/service/**</exclude>
+                                        <exclude>org/apache/hadoop/thirdparty/**</exclude>
+                                        <exclude>org/apache/hadoop/tools/**</exclude>
+                                        <exclude>org/apache/hadoop/tracing/**</exclude>
+                                        <exclude>org/apache/hadoop/util/**</exclude>
+                                        <exclude>org/apache/hadoop/classification/**</exclude>
+                                        <exclude>org/apache/htrace/**</exclude>
+                                        <!-- 去掉各 jar 的签名与冗余元数据，否则合并后报 SecurityException / 体积虚高 -->
                                         <exclude>META-INF/*.SF</exclude>
                                         <exclude>META-INF/*.DSA</exclude>
                                         <exclude>META-INF/*.RSA</exclude>

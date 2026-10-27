@@ -12,10 +12,13 @@ import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -127,69 +130,191 @@ public class HBaseLookupReader implements LookupReader {
         hbaseConf.setInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT, cfg.hbaseOperationTimeoutMs);
         hbaseConf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, cfg.hbaseRetries);
 
-        // Kerberos：在建连前完成认证配置，HBase 2.2.0+ 会据此自动登录并续期
+        // Kerberos：必须在建连前完成。它做三件事：写配置项 -> 配置 UGI -> keytab 登录。
+        // 任何一步缺失都会让后续 RPC 在 SASL 握手阶段才失败，届时日志离根因很远。
         applyKerberos(hbaseConf);
 
-        connection = ConnectionFactory.createAsyncConnection(hbaseConf).get();
-        table = connection.getTable(TableName.valueOf(cfg.hbaseTableName));
-        familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
+        // 先全部用局部变量构建，成功后再一次性发布：
+        // 失败时不会留下「connection 已建、opened 仍为 false」的半初始化对象
+        AsyncConnection conn = null;
+        try {
+            conn = ConnectionFactory.createAsyncConnection(hbaseConf).get();
+            TableName tableName = TableName.valueOf(cfg.hbaseTableName);
+            AsyncTable<AdvancedScanResultConsumer> asyncTable = conn.getTable(tableName);
 
-        // 预热 region location：首条查询若才去定位 region（冷启动），
-        // 会因「waiting for region location」耗时数百毫秒而撞上 500ms 超时被降级。
-        // 提前在建连时取好 location，后续查询直接命中客户端缓存。
-        // 注意：getRegionLocator() 是同步返回 AsyncTableRegionLocator，getAllRegionLocations() 才返回 CompletableFuture。
-        table.getRegionLocator()
-                .getAllRegionLocations()
-                .get(cfg.hbaseOperationTimeoutMs, TimeUnit.MILLISECONDS);
+            // 预热 region location：首条查询若才去定位 region（冷启动），
+            // 会因「waiting for region location」耗时数百毫秒而撞上 500ms 超时被降级。
+            // 提前在建连时取好 location，后续查询直接命中客户端缓存。
+            //
+            // ⚠️ HBase 2.2.x 的 AsyncTable 没有 getRegionLocator()（那是 2.4+ 才补的 API），
+            //    必须从 AsyncConnection 上取；用 2.6.x 的写法换到 2.2.7 会在编译期直接失败。
+            conn.getRegionLocator(tableName)
+                    .getAllRegionLocations()
+                    .get(cfg.hbaseOperationTimeoutMs, TimeUnit.MILLISECONDS);
 
-        // 超时调度器：一个 Reader 一个线程足够（只做「到点标记超时」这个轻量动作）
-        timeoutScheduler = new ScheduledThreadPoolExecutor(1, r -> {
-            Thread t = new Thread(r, "dual-lookup-hbase-timeout");
-            t.setDaemon(true);
-            return t;
-        });
-        // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻，
-        // 高 QPS 时「查询早已完成」的超时任务仍会堆积；开启后 cancel(false) 立即释放队列空间
-        timeoutScheduler.setRemoveOnCancelPolicy(true);
+            // 超时调度器：一个 Reader 一个线程足够（只做「到点标记超时」这个轻量动作）
+            ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread t = new Thread(r, "dual-lookup-hbase-timeout");
+                t.setDaemon(true);
+                return t;
+            });
+            // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻，
+            // 高 QPS 时「查询早已完成」的超时任务仍会堆积；开启后 cancel(false) 立即释放队列空间
+            scheduler.setRemoveOnCancelPolicy(true);
 
-        // 放在最后：以上任一步骤抛异常，opened 仍为 false，下次查询会重新尝试建连
-        opened = true;
+            this.connection = conn;
+            this.table = asyncTable;
+            this.familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
+            this.timeoutScheduler = scheduler;
+            // 放在最后：以上任一步骤抛异常，opened 仍为 false，下次查询会重新尝试建连
+            opened = true;
+        } catch (Exception e) {
+            // 预热点（region location）失败时连接已经建立，必须显式关闭它。
+            // 否则下次 open() 会用新连接覆盖字段，旧连接的 Netty 线程池与 ZK 会话将永久泄漏——
+            // 这类泄漏在「HBase 刚重启、region 尚未上线」的窗口期会每批次发生一次，很容易把 TM 拖垮。
+            closeQuietly(conn);
+            throw e;
+        }
         // rowkey 编码模式务必打出来：它决定了「能不能查到数据」，是排查「HBase 全部查不到」时的第一现场
         LOG.info("[dual-lookup] HBase reader opened, table={}, family={}, zk={}, rowkeyEncoding={}",
                 cfg.hbaseTableName, cfg.hbaseColumnFamily, cfg.hbaseZkQuorum, cfg.hbaseRowkeyEncoding);
     }
 
+    /** 忽略异常地关闭连接，只用于失败清理路径；避免清理动作本身掩盖真正的失败原因 */
+    private static void closeQuietly(AsyncConnection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.close();
+        } catch (Exception e) {
+            LOG.warn("[dual-lookup] 关闭建连失败的 HBase 连接时出错（忽略）", e);
+        }
+    }
+
     /**
-     * 配置 Kerberos 认证。HBase 2.2.0+ 的 ConnectionFactory 只要发现
-     * {@code hbase.client.keytab.file} + {@code hbase.client.kerberos.principal}，
-     * 就会自动完成登录和 TGT 续期，应用侧无需再手动调用 UserGroupInformation。
+     * Kerberos 完整链路：<b>写配置项 → 配置 UGI → keytab 登录</b>。三步缺一不可。
      *
-     * <p>这也是为什么本连接器能在长期运行的流作业里安全使用 Kerberos：凭据续期交给客户端，
-     * 不会出现「作业跑几天后 TGT 过期导致全部查询失败」的经典问题。
+     * <p>为什么不能只写 {@code hbase.*} 配置项？因为 HBase 2.2.x 的
+     * {@code ConnectionFactory.createAsyncConnection(conf)} 内部会调用
+     * {@code AuthUtil.loginClient(conf)}，而它的第一道门槛是
+     * {@code UGI.isSecurityEnabled()}。UGI 只看自己那份静态配置，不看 {@code hbase.security.authentication}；
+     * 只要没人调用过 {@link UserGroupInformation#setConfiguration}，
+     * 哪怕 hbase 侧全配成 kerberos，UGI 仍认为自己在 simple 模式，于是
+     * <b>keytab 自动登录被整段跳过</b>，最后在 SASL 握手处以
+     * "GSS initiate failed / No valid credentials" 收场——日志离根因非常远。
+     *
+     * <p>第二处坑是 principal 的 key 名：HBase 2.2.x 的 {@code AuthUtil} 常量
+     * {@code HBASE_CLIENT_KERBEROS_PRINCIPAL} 的<b>字符串值是 {@code hbase.client.keytab.principal}</b>，
+     * 而官方文档写的是 {@code hbase.client.kerberos.principal}。只写后者时
+     * {@code shouldLoginFromKeytab()} 会返回 false，同样静默跳过登录。这里两个 key 都写。
+     *
+     * <p>登录成功后，续期由两处共同保证：UGI 会为「keytab 登录用户」拉起自己的自动续期线程
+     * （{@code getLoginUser()} 首次调用时 {@code spawnAutoRenewalThreadForUserCreds}），
+     * HBase 的 {@code AsyncConnectionImpl} 也会因为 {@code user.isLoginFromKeytab()} 为 true
+     * 再拉起一个续期 chore（每 30s 调一次 {@code checkTGTAndReloginFromKeytab}）。
+     * 因此长跑作业不需要自己写续期线程。
+     *
+     * <p><b>注意</b>：{@code UGI.setConfiguration} 与 {@code loginUserFromKeytab} 都是
+     * JVM 级全局状态，同一 TaskManager 上的多个作业共享。若同 TM 上存在使用不同 principal
+     * 的多个作业，后来的会切换全局登录用户（与原生 HBase 客户端行为一致）。
      */
-    private void applyKerberos(Configuration conf) {
-        if (!"kerberos".equalsIgnoreCase(cfg.hbaseSecurityAuthentication)) {
+    private void applyKerberos(Configuration conf) throws IOException {
+        if (!"kerberos".equals(cfg.hbaseSecurityAuthentication)) {
             return; // 默认 simple 模式，直接返回，零开销
         }
-        // krb5.conf 是 JVM 级系统属性，必须在建连（发起认证）之前设置
+        String keytab = cfg.hbaseClientKeytabFile.trim();
+        String principal = cfg.hbaseClientKerberosPrincipal.trim();
+
+        // ---- 0) keytab 可读性 ----
+        // keytab 是 TM 本地文件。提前检查能把「哪台机器、哪个路径不可读」直接写进异常，
+        // 否则只会看到 JAAS 层的 KinitException，排查时还要挨个节点猜。
+        File keytabFile = new File(keytab);
+        if (!keytabFile.isFile() || !keytabFile.canRead()) {
+            throw new IOException("[dual-lookup] keytab 不可读: " + keytab
+                    + "（该文件必须存在于每个 TaskManager 上，且运行用户可读）");
+        }
+
+        // ---- 1) krb5.conf ----
+        // JVM 级系统属性，必须在第一次 GSS/Kerberos 调用之前生效。
+        // 不无脑覆盖：启动脚本若已用 -Djava.security.krb5.conf 指定，就沿用启动参数，
+        // 避免同一台 TM 上多个作业互相改写这个全局属性。
         if (!cfg.hbaseKrb5Conf.trim().isEmpty()) {
-            System.setProperty("java.security.krb5.conf", cfg.hbaseKrb5Conf.trim());
+            String existing = System.getProperty("java.security.krb5.conf");
+            String wanted = cfg.hbaseKrb5Conf.trim();
+            if (existing == null || existing.trim().isEmpty()) {
+                System.setProperty("java.security.krb5.conf", wanted);
+                LOG.info("[dual-lookup] 已设置 java.security.krb5.conf={}", wanted);
+            } else if (!existing.trim().equals(wanted)) {
+                LOG.warn("[dual-lookup] java.security.krb5.conf 已被启动参数设为 {}，忽略 "
+                        + "hbase.kerberos.krb5.conf={}（该属性全局生效，建议统一在 JVM 启动参数里配置）",
+                        existing, wanted);
+            }
         }
+
+        // ---- 2) 配置项 ----
+        // 抽成独立方法：这部分是纯字符串映射，不需要 KDC 就能单测（见 KerberosConfigTest）
+        writeKerberosConfig(conf, keytab, principal);
+
+        // ---- 3) 把配置交给 UGI（关键一步） ----
+        UserGroupInformation.setConfiguration(conf);
+        if (!UserGroupInformation.isSecurityEnabled()) {
+            throw new IOException("[dual-lookup] 已配置 kerberos 但 UGI 仍判定为 simple 模式，"
+                    + "keytab 登录会被静默跳过。请确认没有在 JVM 启动参数里强制 simple 认证");
+        }
+
+        // ---- 4) 显式 keytab 登录 ----
+        // 注意 UGI.loginUserFromKeytab 的第一行就是 `if (!isSecurityEnabled()) return;`——
+        // 也就是说 security 没开时它会<b>静默返回、不报错</b>。上面第 3 步的断言正是为了
+        // 避免落到这个静默分支里；否则这里看似"登录成功"，实际没有任何凭据。
+        // 不依赖 HBase 内部「是否已登录」的判断：这里登录后，AuthUtil.loginClient 会看到
+        // hasKerberosCredentials=true 且 principal 匹配，直接复用，行为更确定。
+        try {
+            UserGroupInformation.loginUserFromKeytab(principal, keytab);
+        } catch (IOException e) {
+            throw new IOException("[dual-lookup] keytab 登录失败, principal=" + principal
+                    + ", keytab=" + keytab
+                    + "。请先用 klist -kt <keytab> 核对 principal 与 keytab 是否匹配，"
+                    + "并确认 TM 与 KDC 时间差在 5 分钟内", e);
+        }
+
+        LOG.info("[dual-lookup] HBase Kerberos 就绪: principal={}, keytab={}, rpc.protection={}, loginUser={}",
+                principal, keytab, cfg.hbaseRpcProtection, currentUserName());
+    }
+
+    /**
+     * 把 Kerberos 相关配置项写进 HBase 配置（纯映射，不碰 UGI、不发起登录）。
+     *
+     * <p>单独抽出来的原因：这是「配了却不生效」的高发区，而验证它不需要 KDC。
+     * 包可见以便单元测试直接断言映射关系（尤其是两个 principal key 都要写）。
+     */
+    void writeKerberosConfig(Configuration conf, String keytab, String principal) {
+        // hadoop.* 决定 UGI 的认证方式；hbase.* 决定 HBase RPC 走 SASL。
+        conf.set("hadoop.security.authentication", "kerberos");
         conf.set("hbase.security.authentication", "kerberos");
-        if (!cfg.hbaseClientKeytabFile.trim().isEmpty()) {
-            conf.set("hbase.client.keytab.file", cfg.hbaseClientKeytabFile.trim());
-        }
-        if (!cfg.hbaseClientKerberosPrincipal.trim().isEmpty()) {
-            conf.set("hbase.client.kerberos.principal", cfg.hbaseClientKerberosPrincipal.trim());
-        }
+        conf.set("hbase.rpc.protection", cfg.hbaseRpcProtection);
+        // 两个 principal key 都写：2.2.x 的 AuthUtil 实际读 keytab.principal，
+        // 官方文档写 kerberos.principal；只写一个会出现"配了但登录被跳过"。
+        conf.set("hbase.client.keytab.file", keytab);
+        conf.set("hbase.client.keytab.principal", principal);
+        conf.set("hbase.client.kerberos.principal", principal);
+        // 服务端 principal：不配时 HBase 默认按 hbase/_HOST@REALM 规则推导，
+        // 只有集群改过 principal 名才需要显式指定
         if (!cfg.hbaseRegionserverKerberosPrincipal.trim().isEmpty()) {
             conf.set("hbase.regionserver.kerberos.principal", cfg.hbaseRegionserverKerberosPrincipal.trim());
         }
         if (!cfg.hbaseMasterKerberosPrincipal.trim().isEmpty()) {
             conf.set("hbase.master.kerberos.principal", cfg.hbaseMasterKerberosPrincipal.trim());
         }
-        LOG.info("[dual-lookup] HBase Kerberos enabled, principal={}, keytab={}",
-                cfg.hbaseClientKerberosPrincipal, cfg.hbaseClientKeytabFile);
+    }
+
+    /** 当前 UGI 用户名，仅用于启动日志；取不到时返回明确的占位符，绝不让日志本身抛异常 */
+    private static String currentUserName() {
+        try {
+            return UserGroupInformation.getCurrentUser().getUserName();
+        } catch (IOException e) {
+            return "<unknown: " + e.getMessage() + ">";
+        }
     }
 
     @Override

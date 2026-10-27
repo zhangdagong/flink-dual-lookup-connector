@@ -53,6 +53,8 @@ public class DualLookupOptionsTest {
         assertEquals("string", cfg.hbaseRowkeyEncoding);
         assertEquals(10, cfg.failoverLogIntervalSec);        // 降级日志默认 10s 限流
         assertEquals(360, cfg.statsLogIntervalSec);          // 统计日志默认 6 分钟一条
+        assertEquals("simple", cfg.hbaseSecurityAuthentication);
+        assertEquals("authentication", cfg.hbaseRpcProtection);
     }
 
     @Test
@@ -151,5 +153,57 @@ public class DualLookupOptionsTest {
         DualLookupOptions.Config cfg = parse(base());
         assertEquals("dim_account", cfg.hbaseTableName);
         assertEquals("dim_account", cfg.dorisTableName);
+    }
+
+    // ==================== Kerberos 相关校验 ====================
+
+    @Test
+    public void authenticationOnlyAcceptsSimpleOrKerberos() {
+        // 拼错（kerberbos）若被静默当成 simple，最终会在 SASL 阶段炸，离根因很远
+        Configuration bad = base();
+        bad.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberbos");
+        assertRejected(bad, "hbase.security.authentication");
+
+        // 大小写/空格应被归一化，而不是判为非法
+        Configuration ok = base();
+        ok.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "  Kerberos ");
+        ok.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/tmp/ro.keytab");
+        ok.setString(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL.key(), "ro@EXAMPLE.COM");
+        assertEquals("kerberos", parse(ok).hbaseSecurityAuthentication);
+    }
+
+    @Test
+    public void kerberosRequiresKeytabAndPrincipal() {
+        // 只开 kerberos 不给 keytab：在 TM 上没有 TGT 时会静默回退并最终 SASL 失败
+        Configuration onlySwitch = base();
+        onlySwitch.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        assertRejected(onlySwitch, "hbase.client.keytab.file");
+
+        // 有 keytab 没 principal，同样无法登录
+        Configuration noPrincipal = base();
+        noPrincipal.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        noPrincipal.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/tmp/ro.keytab");
+        assertRejected(noPrincipal, "hbase.client.kerberos.principal");
+    }
+
+    @Test
+    public void clientPrincipalRejectsHostPlaceholder() {
+        // _HOST 是服务端 principal 的占位符，客户端用它登录必然失败
+        Configuration c = base();
+        c.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/tmp/ro.keytab");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL.key(), "ro/_HOST@EXAMPLE.COM");
+        assertRejected(c, "_HOST");
+    }
+
+    @Test
+    public void rpcProtectionOnlyAcceptsKnownLevels() {
+        Configuration bad = base();
+        bad.setString(DualLookupOptions.HBASE_RPC_PROTECTION.key(), "encrypted");
+        assertRejected(bad, "hbase.rpc.protection");
+
+        Configuration ok = base();
+        ok.setString(DualLookupOptions.HBASE_RPC_PROTECTION.key(), "PRIVACY");
+        assertEquals("privacy", parse(ok).hbaseRpcProtection);
     }
 }

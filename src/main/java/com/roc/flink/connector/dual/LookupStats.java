@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *
  * <p>为什么用定时日志而不是 Flink 指标：异步 Lookup Function 确实拿不到 {@code RuntimeContext}，
  * 但它的 {@code open(FunctionContext)} 提供的 {@code FunctionContext.getMetricGroup()} 就是
- * <b>本并行子任务的 metric group</b>，注册 {@code Counter}/{@code Gauge} 是可行的（见 README 第 14 章）。
+ * <b>本并行子任务的 metric group</b>，注册 {@code Counter}/{@code Gauge} 是可行的（见 README 第 13 章）。
  * 这里仍选日志，是因为巡检与复盘需要「一行看全 + 可直接 grep + 能带文本字段（失败原因、
  * 本阶段与累计两个视角）」，而 {@code Gauge} 只给单个数值；另外 {@code FunctionContext}
  * 在常量折叠等本地执行路径上拿到的是未注册的 metric group，两条路径行为不一致，日志则始终一致。
@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * 阶段值靠「当前累计 − 上次快照」换算，快照字段见 {@link #lastSample}。
  * 两段共用同一份 {@link Sample}，保证两个视角来自同一时刻，日志内部不会自相矛盾。
  *
- * <p><b>两个刻意不一致的口径</b>（都容易看错，详见 README 第 8 章）：
+ * <p><b>两个刻意不一致的口径</b>（都容易看错，详见 README 第 10 章）：
  * <ol>
  *   <li>{@code max=} 是<b>区间最大值，不能用「累计相减」换算</b>，因此由写侧用
  *       {@code getAndSet(0)} 取走（见 {@link #snapshotLine()}）；漏打一行时峰值只会顺延到

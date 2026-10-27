@@ -231,11 +231,39 @@ public final class DualLookupOptions {
                     .stringType()
                     .defaultValue("simple");
 
+    /**
+     * SASL 保护级别：authentication（默认，只认证）、integrity（校验完整性）、privacy（加密）。
+     *
+     * <p>对应 HBase 的 {@code hbase.rpc.protection}。多数集群保持默认 authentication 即可；
+     * 若服务端配置了 {@code privacy}/更高的级别，客户端必须一致，否则握手阶段就会失败。
+     * 这类失败在日志里通常只表现为 "SaslException: ... GSS initiate failed"，很难反推配置项，
+     * 因此把它显式暴露成参数，建表时写清楚。
+     */
+    public static final ConfigOption<String> HBASE_RPC_PROTECTION =
+            ConfigOptions.key("hbase.rpc.protection")
+                    .stringType()
+                    .defaultValue("authentication");
+
     /** 客户端 keytab 文件路径（kerberos 下必填） */
     public static final ConfigOption<String> HBASE_CLIENT_KEYTAB_FILE =
             ConfigOptions.key("hbase.client.keytab.file").stringType().noDefaultValue();
 
-    /** 客户端 Kerberos principal，如 hbase/ro@EXAMPLE.COM（kerberos 下必填） */
+    /**
+     * 客户端 Kerberos principal，形如 {@code ro@EXAMPLE.COM}（kerberos 下必填）。
+     *
+     * <p><b>为什么这里叫 kerberos.principal 而运行期要写两个 key？</b>
+     * HBase 2.2.x 的 {@code AuthUtil.loginClient()} 实际读取的常量值却是
+     * <b>{@code hbase.client.keytab.principal}</b>（常量名 {@code HBASE_CLIENT_KERBEROS_PRINCIPAL}
+     * 与它的字符串值不一致，官方 javadoc 又写作 {@code hbase.client.kerberos.principal}）。
+     * 只写文档里那个 key 时，{@code shouldLoginFromKeytab()} 会判定"没配 principal"，
+     * 于是 keytab 自动登录被静默跳过——这正是"配了 Kerberos 却始终认证不上"的常见原因。
+     *
+     * <p>因此 {@code HBaseLookupReader} 会把同一个值同时写入两个 key，两种读法都能命中。
+     *
+     * <p><b>注意：客户端 principal 必须是具体账号，不能含 {@code _HOST}</b>。
+     * {@code _HOST} 是服务端（RS/Master）principal 的占位符，客户端用它登录只会失败，
+     * 且报错信息与根因相距很远，故在建表阶段直接拦下。
+     */
     public static final ConfigOption<String> HBASE_CLIENT_KERBEROS_PRINCIPAL =
             ConfigOptions.key("hbase.client.kerberos.principal").stringType().noDefaultValue();
 
@@ -363,7 +391,8 @@ public final class DualLookupOptions {
         public int hbaseRpcTimeoutMs;
         public int hbaseOperationTimeoutMs;
         public int hbaseRetries;
-        public String hbaseSecurityAuthentication;
+        public String hbaseSecurityAuthentication;   // simple（默认）| kerberos
+        public String hbaseRpcProtection;            // authentication（默认）| integrity | privacy
         public String hbaseClientKeytabFile;
         public String hbaseClientKerberosPrincipal;
         public String hbaseRegionserverKerberosPrincipal;
@@ -418,7 +447,8 @@ public final class DualLookupOptions {
             cfg.hbaseRpcTimeoutMs = c.get(HBASE_RPC_TIMEOUT_MS);
             cfg.hbaseOperationTimeoutMs = c.get(HBASE_OPERATION_TIMEOUT_MS);
             cfg.hbaseRetries = c.get(HBASE_RETRIES);
-            cfg.hbaseSecurityAuthentication = c.get(HBASE_SECURITY_AUTHENTICATION);
+            cfg.hbaseSecurityAuthentication = normalizeAuthentication(c.get(HBASE_SECURITY_AUTHENTICATION));
+            cfg.hbaseRpcProtection = normalizeRpcProtection(c.get(HBASE_RPC_PROTECTION));
             cfg.hbaseClientKeytabFile = c.getOptional(HBASE_CLIENT_KEYTAB_FILE).orElse("");
             cfg.hbaseClientKerberosPrincipal = c.getOptional(HBASE_CLIENT_KERBEROS_PRINCIPAL).orElse("");
             cfg.hbaseRegionserverKerberosPrincipal = c.getOptional(HBASE_REGIONSERVER_KERBEROS_PRINCIPAL).orElse("");
@@ -510,13 +540,24 @@ public final class DualLookupOptions {
             if (cfg.dorisJdbcUrl == null || cfg.dorisJdbcUrl.trim().isEmpty()) {
                 throw new IllegalArgumentException("[dual-lookup] doris.jdbc-url 必填");
             }
-            // Kerberos 模式下 keytab 与 principal 必须成对出现，缺一无法完成登录
-            if ("kerberos".equalsIgnoreCase(cfg.hbaseSecurityAuthentication)
-                    && (cfg.hbaseClientKeytabFile.trim().isEmpty()
-                    || cfg.hbaseClientKerberosPrincipal.trim().isEmpty())) {
-                throw new IllegalArgumentException(
-                        "[dual-lookup] hbase.security.authentication=kerberos 时，"
-                                + "hbase.client.keytab.file 与 hbase.client.kerberos.principal 必填");
+            // Kerberos 模式：keytab 与 principal 必须成对出现，缺一无法完成登录。
+            // 这两个参数不配的后果是「静默回退到 kinit 凭据」——在 Flink TM 上通常没有 TGT，
+            // 表现为连接阶段 SASL 失败，而日志不会提示"你少配了 keytab"，因此必须建表期拦住。
+            if ("kerberos".equals(cfg.hbaseSecurityAuthentication)) {
+                if (cfg.hbaseClientKeytabFile.trim().isEmpty()
+                        || cfg.hbaseClientKerberosPrincipal.trim().isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] hbase.security.authentication=kerberos 时，"
+                                    + "hbase.client.keytab.file 与 hbase.client.kerberos.principal 必填");
+                }
+                // _HOST 只适用于服务端 principal（hbase/_HOST@REALM）。客户端 principal 写了它，
+                // 登录必然失败，且失败信息是 GSS/kinit 层面的，和"写错占位符"毫无关联，极难排查。
+                if (cfg.hbaseClientKerberosPrincipal.contains("_HOST")) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] hbase.client.kerberos.principal 必须是具体账号"
+                                    + "（如 ro@EXAMPLE.COM），不能使用服务端占位符 _HOST，当前为: "
+                                    + cfg.hbaseClientKerberosPrincipal);
+                }
             }
             return cfg;
         }
@@ -547,6 +588,32 @@ public final class DualLookupOptions {
             if (!"string".equals(v) && !"typed".equals(v)) {
                 throw new IllegalArgumentException(
                         "[dual-lookup] hbase.rowkey.encoding 只能取值 string 或 typed，当前为: " + raw);
+            }
+            return v;
+        }
+
+        /**
+         * 归一化认证方式：只接受 simple / kerberos。
+         *
+         * <p>HBase 内部用 {@code equalsIgnoreCase} 判断，所以大小写本身不会出错；这里归一化是为了
+         * 让后续分支判断只写一次，并且把拼错（如 {@code kerberbos}）在建表阶段就变成明确报错，
+         * 而不是静默按 simple 处理、最后在 SASL 阶段炸掉。
+         */
+        private static String normalizeAuthentication(String raw) {
+            String v = raw == null ? "" : raw.trim().toLowerCase();
+            if (!"simple".equals(v) && !"kerberos".equals(v)) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] hbase.security.authentication 只能取值 simple 或 kerberos，当前为: " + raw);
+            }
+            return v;
+        }
+
+        /** 归一化 SASL 保护级别：authentication / integrity / privacy（与 HBase 的取值一致） */
+        private static String normalizeRpcProtection(String raw) {
+            String v = raw == null ? "" : raw.trim().toLowerCase();
+            if (!"authentication".equals(v) && !"integrity".equals(v) && !"privacy".equals(v)) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] hbase.rpc.protection 只能取值 authentication、integrity 或 privacy，当前为: " + raw);
             }
             return v;
         }

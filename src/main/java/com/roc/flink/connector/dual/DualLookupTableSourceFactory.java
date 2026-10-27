@@ -109,6 +109,7 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         optional.add(DualLookupOptions.HBASE_RETRIES);
         // HBase Kerberos
         optional.add(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION);
+        optional.add(DualLookupOptions.HBASE_RPC_PROTECTION);
         optional.add(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE);
         optional.add(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL);
         optional.add(DualLookupOptions.HBASE_REGIONSERVER_KERBEROS_PRINCIPAL);

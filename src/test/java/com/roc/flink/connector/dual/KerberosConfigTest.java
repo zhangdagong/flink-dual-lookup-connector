@@ -1,0 +1,76 @@
+package com.roc.flink.connector.dual;
+
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.VarCharType;
+import org.junit.Test;
+
+import static org.junit.Assert.assertEquals;
+
+/**
+ * Kerberos 配置映射的测试。
+ *
+ * <p>覆盖的是「不接 KDC 也能验证」的那部分——也就是最容易出错、又最难在集群上定位的那部分：
+ * 配置项到 Hadoop/HBase key 的映射关系。真实登录（kinit/keytab）依赖 KDC，无法在单测里完成，
+ * 由 README 第 7 章的手工核验步骤覆盖。
+ *
+ * <p>核心回归点：HBase 2.2.x 的 {@code AuthUtil} 读取的 principal key 是
+ * {@code hbase.client.keytab.principal}，而文档写的是 {@code hbase.client.kerberos.principal}。
+ * 只写后者会让 {@code shouldLoginFromKeytab()} 返回 false，keytab 登录被静默跳过——
+ * 这正是「Kerberos 配了却不生效」的典型原因。两个 key 都必须写。
+ */
+public class KerberosConfigTest {
+
+    private static DualLookupOptions.Config kerberosConfig() {
+        Configuration c = new Configuration();
+        c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
+        c.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/etc/security/keytabs/ro.keytab");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL.key(), "ro@EXAMPLE.COM");
+        c.setString(DualLookupOptions.HBASE_REGIONSERVER_KERBEROS_PRINCIPAL.key(), "hbase/_HOST@EXAMPLE.COM");
+        return DualLookupOptions.Config.from(c, "dim_account");
+    }
+
+    private static HBaseLookupReader reader(DualLookupOptions.Config cfg) {
+        LogicalType[] types = new LogicalType[]{new VarCharType()};
+        return new HBaseLookupReader(cfg, new String[]{"c1"}, types, types);
+    }
+
+    @Test
+    public void writesBothPrincipalKeysAndAuthenticationMode() {
+        org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
+        reader(kerberosConfig()).writeKerberosConfig(hconf, "/k.keytab", "ro@EXAMPLE.COM");
+
+        // HBase 2.2.x 实际读取的 key；漏写它 = keytab 登录被静默跳过
+        assertEquals("ro@EXAMPLE.COM", hconf.get("hbase.client.keytab.principal"));
+        // 官方文档里写的 key（也是后续版本/其他读取路径使用的），同样要写
+        assertEquals("ro@EXAMPLE.COM", hconf.get("hbase.client.kerberos.principal"));
+        assertEquals("/k.keytab", hconf.get("hbase.client.keytab.file"));
+
+        // UGI 的认证方式：不写它，UGI.isSecurityEnabled() 永远是 false，
+        // AuthUtil.loginClient 会整段跳过登录
+        assertEquals("kerberos", hconf.get("hadoop.security.authentication"));
+        assertEquals("kerberos", hconf.get("hbase.security.authentication"));
+        assertEquals("authentication", hconf.get("hbase.rpc.protection"));
+
+        // 服务端 principal 只在显式配置时才写入
+        assertEquals("hbase/_HOST@EXAMPLE.COM", hconf.get("hbase.regionserver.kerberos.principal"));
+    }
+
+    @Test
+    public void rpcProtectionIsPropagated() {
+        Configuration c = new Configuration();
+        c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
+        c.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/etc/security/keytabs/ro.keytab");
+        c.setString(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL.key(), "ro@EXAMPLE.COM");
+        c.setString(DualLookupOptions.HBASE_RPC_PROTECTION.key(), "privacy");
+
+        org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
+        reader(DualLookupOptions.Config.from(c, "dim_account"))
+                .writeKerberosConfig(hconf, "/k.keytab", "ro@EXAMPLE.COM");
+
+        // 服务端要求 privacy 而客户端还是默认 authentication 时，握手阶段才失败，极难定位
+        assertEquals("privacy", hconf.get("hbase.rpc.protection"));
+    }
+}
