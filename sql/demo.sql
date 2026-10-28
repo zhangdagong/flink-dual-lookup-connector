@@ -100,14 +100,19 @@ CREATE TABLE dim_account (
     'hbase.client.operation.timeout'    = '2000',             -- 含冷启动 region 定位，给足
     'hbase.client.retries.number'       = '1',
 
-    -- ===== HBase Kerberos（可选，默认 simple；启用时整块取消注释）=====
-    -- 连接器负责「写配置 -> 配置 UGI -> keytab 登录」，之后 TGT 续期由客户端负责。
-    -- 客户端 principal 必须是具体账号，不能写 _HOST（那是服务端 principal 的占位符）。
+    -- ===== HBase Kerberos（可选，默认 simple；启用时取消注释）=====
+    -- 推荐：keytab 交给 Flink 全局配置（flink-conf.yaml 的 security.kerberos.login.keytab / principal），
+    -- 这里只打开认证方式；连接器会复用 Flink 已登录的 UGI（与 flink-hbase 行为一致）。
     -- 'hbase.security.authentication'         = 'kerberos',
+    -- 'hbase.rpc.protection'                  = 'authentication',  -- 须与服务端一致
+    -- 'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM',
+    -- 只有需要「单表覆盖全局登录用户」时，才显式配置 keytab（两者成对，principal 不能含 _HOST）：
     -- 'hbase.client.kerberos.principal'       = 'ro@EXAMPLE.COM',
     -- 'hbase.client.keytab.file'              = '/path/to/ro.keytab',
-    -- 'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM',
-    -- 'hbase.rpc.protection'                  = 'authentication',  -- 须与服务端一致
+    -- 也可沿用 flink-hbase 的写法：properties.* 原样透传给 HBase Configuration（二选一）
+    -- 'properties.hbase.client.keytab.file'        = '/path/to/ro.keytab',
+    -- 'properties.hbase.client.kerberos.principal' = 'ro@EXAMPLE.COM',
+    -- 注意：keytab 只需在真正读它的 TM 上可读；若本表不配 keytab，则完全复用 Flink 全局登录。
     -- 'hbase.kerberos.krb5.conf'              = '/etc/krb5.conf',
 
     -- ===== Doris =====
@@ -201,4 +206,7 @@ LEFT JOIN dim_account FOR SYSTEM_TIME AS OF t1.proc_time AS m1
 --   停 HBase        -> 作业不失败；lookup_source 变 doris；统计行 failover 增长；WARN 首条带原因
 --   停 Doris(备源)  -> 无影响（备源未建连）；但这段时间容错能力为 0
 --   两源都停        -> 整批异常、作业失败（有意为之：不静默补空）
+--
+-- 5.4 HBase 备源空闲过久时，首次降级可能先重建连接：
+--   日志出现「HBase 连接已断开，重建后重试本批」属正常自愈，该批会继续执行（只重试一次）。
 -- -----------------------------------------------------------------------------

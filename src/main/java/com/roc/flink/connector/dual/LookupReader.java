@@ -38,7 +38,13 @@ public interface LookupReader extends Serializable, AutoCloseable {
      */
     void open() throws Exception;
 
-    /** 当前连接是否可用；未打开时主备路由会先尝试打开再查询 */
+    /**
+     * 当前连接是否<b>真的可用</b>；未打开时主备路由会先尝试打开再查询。
+     *
+     * <p>实现不能只返回一个「打开过」的标志位：底层连接可能已被对端关闭（空闲回收、
+     * ZK 会话过期、服务端重启）。这时必须返回 false，调用方才会触发 {@link #open()} 重建；
+     * 否则连接会一直"看起来可用"，故障持续到重启作业。HBase 实现已按此约定处理。
+     */
     boolean isOpened();
 
     /**

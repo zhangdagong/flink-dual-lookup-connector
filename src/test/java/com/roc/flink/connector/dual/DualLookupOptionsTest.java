@@ -3,6 +3,9 @@ package com.roc.flink.connector.dual;
 import org.apache.flink.configuration.Configuration;
 import org.junit.Test;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -173,17 +176,30 @@ public class DualLookupOptionsTest {
     }
 
     @Test
-    public void kerberosRequiresKeytabAndPrincipal() {
-        // 只开 kerberos 不给 keytab：在 TM 上没有 TGT 时会静默回退并最终 SASL 失败
-        Configuration onlySwitch = base();
-        onlySwitch.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
-        assertRejected(onlySwitch, "hbase.client.keytab.file");
+    public void kerberosWithoutKeytabReusesFlinkLogin() {
+        // 与 flink-hbase 对齐：只开 kerberos、不配 keytab 是合法的——复用 Flink 全局登录
+        // （security.kerberos.login.keytab/principal）或 kinit 凭据。
+        Configuration c = base();
+        c.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        DualLookupOptions.Config cfg = parse(c);
+        assertEquals("kerberos", cfg.hbaseSecurityAuthentication);
+        assertEquals("", cfg.hbaseClientKeytabFile.trim());
+        assertEquals("", cfg.hbaseClientKerberosPrincipal.trim());
+    }
 
-        // 有 keytab 没 principal，同样无法登录
-        Configuration noPrincipal = base();
-        noPrincipal.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
-        noPrincipal.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/tmp/ro.keytab");
-        assertRejected(noPrincipal, "hbase.client.kerberos.principal");
+    @Test
+    public void kerberosKeytabAndPrincipalMustBeConfiguredTogether() {
+        // 有 keytab 没 principal：无法完成登录，建表期拦下
+        Configuration keytabOnly = base();
+        keytabOnly.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        keytabOnly.setString(DualLookupOptions.HBASE_CLIENT_KEYTAB_FILE.key(), "/tmp/ro.keytab");
+        assertRejected(keytabOnly, "要么都配置");
+
+        // 有 principal 没 keytab：同上
+        Configuration principalOnly = base();
+        principalOnly.setString(DualLookupOptions.HBASE_SECURITY_AUTHENTICATION.key(), "kerberos");
+        principalOnly.setString(DualLookupOptions.HBASE_CLIENT_KERBEROS_PRINCIPAL.key(), "ro@EXAMPLE.COM");
+        assertRejected(principalOnly, "要么都配置");
     }
 
     @Test
@@ -205,5 +221,21 @@ public class DualLookupOptionsTest {
         Configuration ok = base();
         ok.setString(DualLookupOptions.HBASE_RPC_PROTECTION.key(), "PRIVACY");
         assertEquals("privacy", parse(ok).hbaseRpcProtection);
+    }
+
+    /**
+     * 与 flink-hbase 对齐：DDL 里的 {@code properties.xxx} 会去掉前缀后原样透传给 HBase Configuration。
+     * 这样从 flink-hbase 迁过来的 `properties.hbase.client.keytab.file` 等写法可以直接复用。
+     */
+    @Test
+    public void propertiesArePassedThroughToHBaseConfig() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("hbase.client.keytab.file", "/path/to/ro.keytab");
+        properties.put("hbase.rpc.timeout", "500");
+
+        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(base(), "dim_account", properties);
+
+        assertEquals("/path/to/ro.keytab", cfg.hbaseProperties.get("hbase.client.keytab.file"));
+        assertEquals("500", cfg.hbaseProperties.get("hbase.rpc.timeout"));
     }
 }

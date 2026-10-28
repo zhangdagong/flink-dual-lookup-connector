@@ -159,10 +159,11 @@ t0       整批查主源 HBase
 
 四者的交叉校验见第 7 章与 `DualLookupOptions`。另外建连阶段会预热 region location，避免冷启动定位耗时撞上 500ms 超时被误判降级。
 
-### 6.4 三条边界
+### 6.4 四条边界
 
 - **查不到 ≠ 故障**：空结果不降级。否则合法缺失会让每批都查两遍，备源压力翻倍。
 - **惰性建连**：Reader 构造时不建连，首次查询才 `open()`。主源启动时不可用也能起作业、直接走备源。Doris 侧连池都是惰性的（`initializationFailTimeout=-1`），避免 HikariCP 建池失败固定睡 1 秒。
+- **连接自愈**：HBase 备源可能长期空闲，连接会被服务端回收。`isOpened()` 同时检查 `AsyncConnection.isClosed()`，断开时自动重建；查询中撞上 `ConnectionClosedException` 还会重建并重试一次（详见第 9 章与第 12 章）。
 - **防打满**：超时回调调 `Statement.cancel()` 真中止 SQL；JDBC `queryTimeout` 自动钳制到 `≤ ceil(lookup.timeout/1000)`；查询线程数 = `doris.pool.size`，队列有界，过载快速拒绝并降级。
 
 ## 7. 参数
@@ -215,12 +216,13 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `hbase.security.authentication` | `simple` | 只接受 `simple` / `kerberos` |
-| `hbase.client.keytab.file` | — | kerberos 下必填，每台 TM 都要有 |
-| `hbase.client.kerberos.principal` | — | 具体账号，**不能含 `_HOST`** |
+| `hbase.client.keytab.file` | — | **可选**。不配时复用 Flink 全局登录（`security.kerberos.login.keytab`）或 kinit 凭据 |
+| `hbase.client.kerberos.principal` | — | **可选**，与 keytab 成对；具体账号，**不能含 `_HOST`** |
 | `hbase.rpc.protection` | `authentication` | `authentication` / `integrity` / `privacy`，须与服务端一致 |
 | `hbase.regionserver.kerberos.principal` | — | 如 `hbase/_HOST@REALM`，集群没改名可不配 |
 | `hbase.master.kerberos.principal` | — | 同上 |
 | `hbase.kerberos.krb5.conf` | — | JVM 已用 `-Djava.security.krb5.conf` 指定则不覆盖 |
+| `properties.*` | — | **原样透传给 HBase `Configuration`**（兼容 flink-hbase），如 `properties.hbase.client.keytab.file` |
 
 ### 7.4 Doris 与连接池
 
@@ -249,25 +251,61 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 
 细节：同一批内所有命中行拿到相同的 `lookup_cost_ms`；降级后它是「主源超时 + 备源查询」之和；主源空结果时两者为 `NULL`。落库后可直接用 SQL 分析降级时段与代价。
 
-## 9. Kerberos
+## 9. Kerberos（与 flink-hbase 对齐）
 
-连接器在建连前完成三步：**写配置 → 配置 UGI → keytab 登录**。登录后 TGT 续期由 UGI 的续期线程与 HBase 的续期 chore 共同负责，长跑作业无需手动 `kinit`。
+**推荐做法：keytab 交给 Flink 全局配置，连接器不写 keytab。**
 
-```sql
-'hbase.security.authentication'         = 'kerberos',
-'hbase.client.kerberos.principal'       = 'ro@EXAMPLE.COM',      -- 具体账号，不能写 _HOST
-'hbase.client.keytab.file'              = '/path/to/ro.keytab',
-'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM',
-'hbase.rpc.protection'                  = 'authentication',      -- 须与服务端一致
+Flink 的 `HadoopModule` 在 TaskManager 启动时就会用 `security.kerberos.login.keytab` /
+`security.kerberos.login.principal` 完成登录，并按 `security.kerberos.relogin.period`（默认 1 分钟）
+自动续期；**flink-hbase 自己并不读 keytab**，直接用这个已登录的 UGI。本连接器行为一致：
+
+```yaml
+# flink-conf.yaml —— 一次配置，所有 TM 生效（keytab 必须存在于每个 TM 的这个路径）
+security.kerberos.login.keytab: /home/flink/streampark/kerberos/trdw.keytab
+security.kerberos.login.principal: ro@EXAMPLE.COM
 ```
 
-三个已处理的坑（排查时要认得）：
+```sql
+-- 维表 DDL 只打开 kerberos 与保护级别即可
+'hbase.security.authentication'         = 'kerberos',
+'hbase.rpc.protection'                  = 'authentication',      -- 须与服务端一致
+'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM'
+```
 
-1. **只配 `hbase.*` 不配 UGI，登录会被静默跳过**。`AuthUtil.loginClient` 的门槛是 `UGI.isSecurityEnabled()`，UGI 不看 `hbase.security.authentication`；`loginUserFromKeytab` 在 security 关闭时还会**静默 return**。连接器已设 `hadoop.security.authentication=kerberos` 并调 `UGI.setConfiguration`，且登录前断言安全已开启。
-2. **principal 的 key 名有两套**。HBase 2.2.x 实际读 `hbase.client.keytab.principal`，文档写 `hbase.client.kerberos.principal`；只写后者会跳过登录。连接器两个 key 都写（`KerberosConfigTest` 守着）。
+需要**单张表覆盖** Flink 全局登录用户时，再显式配 keytab：
+
+```sql
+'hbase.client.kerberos.principal' = 'ro@EXAMPLE.COM',   -- 与 keytab 成对，不能含 _HOST
+'hbase.client.keytab.file'        = '/path/to/ro.keytab'
+```
+
+**与 flink-hbase 的兼容写法**：任何 `properties.xxx` 都会去掉前缀后写进 HBase `Configuration`
+（与 flink-hbase 的 `HBaseConnectorOptionsUtil.getHBaseConfiguration` 完全一致），
+所以从 flink-hbase 迁过来的 DDL 可以原样使用：
+
+```sql
+'properties.hbase.client.keytab.file'        = '/path/to/ro.keytab',
+'properties.hbase.client.kerberos.principal' = 'ro@EXAMPLE.COM'
+```
+
+显式参数（`hbase.client.*`）与 `properties.*` 二选一即可；同时出现时显式参数优先。
+
+凭据选择顺序：
+
+1. **未配 keytab** → 使用当前 UGI（Flink 全局登录 / kinit）；没有任何 Kerberos 凭据时，报错并给出上面两种配置方式；
+2. **配了 keytab 且当前用户就是该 principal** → 复用，不重复登录；
+3. **配了 keytab 但文件不可读、而当前 UGI 已有凭据** → **降级为复用，只打 WARN**（本次生产问题的修复点：不会因为某张表多写了一个只在部分节点存在的路径而让作业起不来）；
+4. 无凭据且 keytab 读不到 → 报错，消息里同时给出两种来源。
+
+三个已处理的坑：
+
+1. **只配 `hbase.*` 不配 UGI，自动登录会被静默跳过**。`AuthUtil.loginClient` 的门槛是 `UGI.isSecurityEnabled()`，UGI 不看 `hbase.security.authentication`；`loginUserFromKeytab` 在 security 关闭时还会**静默 return**。需要自己登录时连接器会设 `hadoop.security.authentication=kerberos` 并 `UGI.setConfiguration`；复用 Flink 登录时**不会**覆盖 Flink 的 UGI 配置（避免破坏它的 auth_to_local / group mapping）。
+2. **principal 的 key 名有两套**。HBase 2.2.x 实际读 `hbase.client.keytab.principal`，文档写 `hbase.client.kerberos.principal`；显式 keytab 模式下连接器两个 key 都写（`KerberosConfigTest` 守着）。
 3. **认证方式拼错不会报错**，等于按 simple 跑。现在建表期只接受 `simple`/`kerberos`。
 
-上线核验：TM 日志出现 `HBase Kerberos 就绪: ... loginUser=ro@EXAMPLE.COM`（必须等于配置的 principal）→ `klist -kt <keytab>` 里确有该 principal → TM 与 KDC 时间差 < 5 分钟 → principal 有表的 `RW` 权限。
+上线核验：日志出现 `HBase Kerberos 复用已登录用户（Flink 全局登录或 kinit）: ro@EXAMPLE.COM`
+（或显式 keytab 模式下的 `HBase Kerberos 就绪: ... loginUser=...`）→ `klist -kt <keytab>` 里确有该 principal
+→ TM 与 KDC 时间差 < 5 分钟 → principal 有表的 `RW` 权限。
 
 ## 10. 可观测性
 
@@ -319,9 +357,11 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | hint 不匹配 | `'table'` 写成了表名而不是 FROM 别名 |
 | **`NoSuchMethodError: FsTracer.get(...)Lorg/apache/htrace/core/Tracer;`** | jar 混入另一世代 Hadoop → `jar tf target/*.jar \| grep -E 'org/apache/hadoop/(fs\|conf\|security)/'` 自查；修复见第 2 章 |
 | 一直降级但 HBase 看起来正常 | `lookup.timeout` 小于实际 P99，或 region 预热点未生效 |
+| **备源 HBase 空闲很久后首次降级报 `ConnectionClosedException: Connection closed`，且之后一直失败** | 服务端回收了空闲连接；旧实现只看 `opened` 布尔值不会重建。**已修复**：健康检查落到 `AsyncConnection.isClosed()`，断开自动重建，查询中撞上还会重试一次 |
 | `hit=` 明显偏低但 `fail=0` | rowkey 编码与写入端不一致 / 表被误删 / 备源同步延迟 |
 | HBase 数值或时间全错乱 | 写入编码与 DDL 类型不匹配（见 7.2） |
-| Kerberos 报 `GSS initiate failed` | 看 `loginUser=`、`klist -kt`、时间差、`hbase.rpc.protection` |
+| Kerberos 报 `GSS initiate failed` / `No valid credentials` | 未配 keytab 时先确认 Flink 全局 `security.kerberos.login.*` 是否生效；再 `klist -kt`、时间差、`hbase.rpc.protection` |
+| 日志报 `hbase.client.keytab.file 不可读`，但 Flink 全局登录是好的 | 新版会降级复用已有 UGI 并打 WARN；若一定要用该 keytab，确认每台 TM 上路径可读 |
 | 作业取消失败 / 卡住 | 确认 `close()` 会补空攒批缓冲（已有回归用例） |
 | TaskManager 连接数过多 | 并行度 × `doris.pool.size` 超出 Doris 承载 |
 
@@ -337,7 +377,7 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 ## 14. 开发与测试
 
 ```bash
-mvn test          # 64 个用例；无外部依赖，可进 CI
+mvn test          # 69 个用例；无外部依赖，可进 CI
 ```
 
 | 类 | 职责 |
@@ -350,3 +390,27 @@ mvn test          # 64 个用例；无外部依赖，可进 CI
 | `LookupStats` | 定时统计日志 |
 
 新增配置项要改三处：`DualLookupOptions` 加 Option 与字段、`Config.from` 赋值、`DualLookupTableSourceFactory.optionalOptions()` 登记（漏了第三步 DDL 会报未知配置）。
+
+## 15. 变更记录（2026-10-28）
+
+本轮针对生产反馈做了三组修复；除 Kerberos 参数变为可选外，不改变 DDL 语义。
+
+**① HBase 连接自愈**（`ConnectionClosedException: Connection closed`）
+
+- 现象：`lookup.primary=doris` 时降级到 HBase 报连接已关闭，且此后每批都失败、看起来"没切备源"。
+- 原因：HBase 备源长期空闲，连接被服务端回收；旧实现只判断 `opened` 布尔值，不会重建。
+- 修复：`isOpened()` 检查 `AsyncConnection.isClosed()`；断开时自动重建；查询过程中撞上断连，会替换"当时那条坏连接"并重试一次（只重试一次，且只针对连接类异常）。
+
+**② Kerberos 与 flink-hbase 对齐**
+
+- flink-hbase 没有 keytab 参数：它用 `properties.*` 把 HBase 客户端配置原样透传，登录交给 HBase `AuthUtil` 复用 Flink 已登录的 UGI。
+- 本连接器新增 `properties.*` 透传；`hbase.client.keytab.file` / `principal` 改为**可选**（不配则复用 Flink 全局登录 / kinit）。
+- keytab 只存在于部分 TM 时：若当前 UGI 已有凭据，**降级为复用并打 WARN**，同时清掉 `hbase.client.keytab.*`，避免 HBase 再去读那个不存在的文件。
+- 只有在"既无可用凭据、keytab 也不可读"时才报错，并提示两种配置来源。
+
+**③ 打包**
+
+- 排除 HBase 父 POM 带入的 `protobuf-java 2.5.0`（HBase 实际用 shaded 副本）与 MySQL 的 protobuf（仅 X DevAPI 需要）。
+- 排除各依赖的 `META-INF/MANIFEST.MF` 并加 `ManifestResourceTransformer`，消除 shade 的「overlapping resource」告警。
+
+验证：`mvn -o clean package` 通过，**69 个测试全绿**。

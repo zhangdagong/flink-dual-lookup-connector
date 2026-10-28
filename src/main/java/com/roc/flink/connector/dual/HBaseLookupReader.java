@@ -11,6 +11,7 @@ import org.apache.hadoop.hbase.client.AsyncTable;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.exceptions.ConnectionClosedException;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.slf4j.Logger;
@@ -26,6 +27,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -45,6 +47,11 @@ import java.util.concurrent.TimeoutException;
  *   <li>Future 层：{@code lookup.timeout}，由本类调度器强制让 Future 以 TimeoutException 结束，
  *       目的是<b>让业务层立刻降级</b>，不必等 HBase 把重试走完。</li>
  * </ol>
+ *
+ * <p><b>连接自愈</b>：HBase 连接可能因空闲回收 / ZK 会话过期 / RS 重启而被关闭。本类在
+ * {@link #isOpened()} 里检查 {@code AsyncConnection.isClosed()}，{@link #open()} 会自动重建；
+ * 查询过程中撞上 {@code ConnectionClosedException} 时，还会替换掉"当时那条坏连接"并重试一次。
+ * 否则备源长时间空闲后第一次降级就会失败，并持续失败到重启作业。
  */
 public class HBaseLookupReader implements LookupReader {
 
@@ -77,12 +84,13 @@ public class HBaseLookupReader implements LookupReader {
 
     /** 是否已建连；volatile 保证多线程可见性（攒批线程可能来自不同调用栈） */
     private transient volatile boolean opened = false;
-    /** 异步连接：内部自带 Netty 线程池，整个 Reader 生命周期内共享一个即可 */
-    private transient AsyncConnection connection;
+    /** 异步连接：内部自带 Netty 线程池，整个 Reader 生命周期内共享一个即可。
+     *  volatile：连接可能被 HBase 侧关闭（空闲回收 / ZK 会话过期），查询线程要能立刻看到最新引用 */
+    private transient volatile AsyncConnection connection;
     /** 异步表句柄：轻量对象，复用才能命中客户端侧的 region location 缓存 */
-    private transient AsyncTable<AdvancedScanResultConsumer> table;
+    private transient volatile AsyncTable<AdvancedScanResultConsumer> table;
     /** 列族名，提前转好 byte[]（每次查询都要用，避免重复编码） */
-    private transient byte[] familyBytes;
+    private transient volatile byte[] familyBytes;
     /** 专门用于「到期强制让 Future 超时」的调度线程池；
      * 用 ScheduledThreadPoolExecutor 而非 Executors 工厂方法：后者返回的是包装类，
      * 拿不到队列句柄，无法观测「已完成查询的超时任务是否被及时清理」 */
@@ -108,14 +116,25 @@ public class HBaseLookupReader implements LookupReader {
     /**
      * 建连 + 预热。synchronized 保证多线程下只真正执行一次（幂等）。
      *
+     * <p><b>连接被关闭时会自动重建</b>：HBase 的异步连接可能因为空闲回收、ZK 会话过期或
+     * RegionServer 重启而被关闭。若只看 {@code opened} 布尔标志，就会出现「第一次降级时
+     * 撞上一年前建立的死连接」——错误是 {@code ConnectionClosedException: Connection closed}，
+     * 而且之后每一批都会失败。因此健康判断必须落到 {@code AsyncConnection.isClosed()}。
+     *
      * <p>注意这里是<b>同步阻塞</b>的：HBase 不可用时 {@code createAsyncConnection().get()} 会一直等到
      * ZooKeeper/客户端超时。这是「精简优先」的取舍——作业启动期不会因此失败（惰性建连），
      * 但建连那一刻的个别批次会被阻塞住，靠 ZK 超时兜底。
      */
     @Override
     public synchronized void open() throws Exception {
-        if (opened) {
+        AsyncConnection existing = connection;
+        if (opened && existing != null && !existing.isClosed()) {
             return;
+        }
+        if (existing != null) {
+            LOG.warn("[dual-lookup] HBase 连接已被关闭（空闲回收 / ZK 会话过期 / RS 重启），重建连接：table={}",
+                    cfg.hbaseTableName);
+            resetConnection();
         }
         // HBaseConfiguration.create() 会先读 classpath 下的 hbase-site.xml 作为基线
         Configuration hbaseConf = HBaseConfiguration.create();
@@ -130,8 +149,16 @@ public class HBaseLookupReader implements LookupReader {
         hbaseConf.setInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT, cfg.hbaseOperationTimeoutMs);
         hbaseConf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, cfg.hbaseRetries);
 
-        // Kerberos：必须在建连前完成。它做三件事：写配置项 -> 配置 UGI -> keytab 登录。
-        // 任何一步缺失都会让后续 RPC 在 SASL 握手阶段才失败，届时日志离根因很远。
+        // properties.* 透传：与 flink-hbase 的 HBaseConnectorOptionsUtil.getHBaseConfiguration 一致，
+        // 逐项写入 HBase Configuration（DDL 里的前缀已由 Factory 去掉）。
+        // 放在 Kerberos 之前，applyKerberos 才能看到 properties 里配置的 keytab/principal。
+        if (cfg.hbaseProperties != null && !cfg.hbaseProperties.isEmpty()) {
+            for (Map.Entry<String, String> property : cfg.hbaseProperties.entrySet()) {
+                hbaseConf.set(property.getKey(), property.getValue());
+            }
+        }
+
+        // Kerberos：必须在建连前完成。优先复用 Flink 已登录的 UGI，见 applyKerberos。
         applyKerberos(hbaseConf);
 
         // 先全部用局部变量构建，成功后再一次性发布：
@@ -152,20 +179,24 @@ public class HBaseLookupReader implements LookupReader {
                     .getAllRegionLocations()
                     .get(cfg.hbaseOperationTimeoutMs, TimeUnit.MILLISECONDS);
 
-            // 超时调度器：一个 Reader 一个线程足够（只做「到点标记超时」这个轻量动作）
-            ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
-                Thread t = new Thread(r, "dual-lookup-hbase-timeout");
-                t.setDaemon(true);
-                return t;
-            });
-            // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻，
-            // 高 QPS 时「查询早已完成」的超时任务仍会堆积；开启后 cancel(false) 立即释放队列空间
-            scheduler.setRemoveOnCancelPolicy(true);
+            // 超时调度器：一个 Reader 一个线程足够（只做「到点标记超时」这个轻量动作）。
+            // 重连时复用已有实例——否则每次重建都会漏掉一个线程池。
+            ScheduledThreadPoolExecutor scheduler = timeoutScheduler;
+            if (scheduler == null || scheduler.isShutdown()) {
+                scheduler = new ScheduledThreadPoolExecutor(1, r -> {
+                    Thread t = new Thread(r, "dual-lookup-hbase-timeout");
+                    t.setDaemon(true);
+                    return t;
+                });
+                // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻，
+                // 高 QPS 时「查询早已完成」的超时任务仍会堆积；开启后 cancel(false) 立即释放队列空间
+                scheduler.setRemoveOnCancelPolicy(true);
+                timeoutScheduler = scheduler;
+            }
 
             this.connection = conn;
             this.table = asyncTable;
             this.familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
-            this.timeoutScheduler = scheduler;
             // 放在最后：以上任一步骤抛异常，opened 仍为 false，下次查询会重新尝试建连
             opened = true;
         } catch (Exception e) {
@@ -178,6 +209,16 @@ public class HBaseLookupReader implements LookupReader {
         // rowkey 编码模式务必打出来：它决定了「能不能查到数据」，是排查「HBase 全部查不到」时的第一现场
         LOG.info("[dual-lookup] HBase reader opened, table={}, family={}, zk={}, rowkeyEncoding={}",
                 cfg.hbaseTableName, cfg.hbaseColumnFamily, cfg.hbaseZkQuorum, cfg.hbaseRowkeyEncoding);
+    }
+
+    /** 丢弃当前连接（不改动超时调度器），下次 open() 会重建。 */
+    private synchronized void resetConnection() {
+        opened = false;
+        AsyncConnection old = connection;
+        connection = null;
+        table = null;
+        familyBytes = null;
+        closeQuietly(old);
     }
 
     /** 忽略异常地关闭连接，只用于失败清理路径；避免清理动作本身掩盖真正的失败原因 */
@@ -193,31 +234,35 @@ public class HBaseLookupReader implements LookupReader {
     }
 
     /**
-     * Kerberos 完整链路：<b>写配置项 → 配置 UGI → keytab 登录</b>。三步缺一不可。
+     * Kerberos 认证：<b>与 flink-hbase 保持一致，优先复用 Flink 已登录的 UGI</b>。
      *
-     * <p>为什么不能只写 {@code hbase.*} 配置项？因为 HBase 2.2.x 的
-     * {@code ConnectionFactory.createAsyncConnection(conf)} 内部会调用
-     * {@code AuthUtil.loginClient(conf)}，而它的第一道门槛是
-     * {@code UGI.isSecurityEnabled()}。UGI 只看自己那份静态配置，不看 {@code hbase.security.authentication}；
-     * 只要没人调用过 {@link UserGroupInformation#setConfiguration}，
-     * 哪怕 hbase 侧全配成 kerberos，UGI 仍认为自己在 simple 模式，于是
-     * <b>keytab 自动登录被整段跳过</b>，最后在 SASL 握手处以
-     * "GSS initiate failed / No valid credentials" 收场——日志离根因非常远。
+     * <p>Flink 的 {@code HadoopModule} 在 TaskManager 启动时就会用
+     * {@code security.kerberos.login.keytab} / {@code security.kerberos.login.principal}
+     * 完成登录（并起一个 {@code security.kerberos.relogin.period} 周期 —— 默认 1 分钟 —— 的
+     * TGT 续期任务）。flink-hbase 自己不读任何 keytab，拿到的是这个已登录的 UGI。
      *
-     * <p>第二处坑是 principal 的 key 名：HBase 2.2.x 的 {@code AuthUtil} 常量
-     * {@code HBASE_CLIENT_KERBEROS_PRINCIPAL} 的<b>字符串值是 {@code hbase.client.keytab.principal}</b>，
-     * 而官方文档写的是 {@code hbase.client.kerberos.principal}。只写后者时
-     * {@code shouldLoginFromKeytab()} 会返回 false，同样静默跳过登录。这里两个 key 都写。
+     * <p>因此本连接器的规则是：
+     * <ol>
+     *   <li>未配置 {@code hbase.client.keytab.file}：直接复用当前 UGI（Flink 全局登录 / kinit）；
+     *       没有凭据时给出明确的双选一提示，而不是抛一句 GSS 错误；</li>
+     *   <li>配置了 keytab 且当前用户就是该 principal：复用，不重复登录；</li>
+     *   <li>配置了 keytab 但文件不可读、而当前 UGI 已有凭据：<b>降级为复用</b>（只打 WARN）。
+     *       这是本次生产问题的修复点——Flink 全局登录已经成功，不应因为某张表多写了一个
+     *       只在部分节点存在的路径而让作业起不来；</li>
+     *   <li>既没有可用凭据、keytab 也读不到：才报错，并在消息里同时给出两种配置方式。</li>
+     * </ol>
      *
-     * <p>登录成功后，续期由两处共同保证：UGI 会为「keytab 登录用户」拉起自己的自动续期线程
-     * （{@code getLoginUser()} 首次调用时 {@code spawnAutoRenewalThreadForUserCreds}），
-     * HBase 的 {@code AsyncConnectionImpl} 也会因为 {@code user.isLoginFromKeytab()} 为 true
-     * 再拉起一个续期 chore（每 30s 调一次 {@code checkTGTAndReloginFromKeytab}）。
-     * 因此长跑作业不需要自己写续期线程。
+     * <p>为什么「只写 hbase.* 配置项」不够？HBase 2.2.x 的
+     * {@code ConnectionFactory.createAsyncConnection(conf)} 会调用 {@code AuthUtil.loginClient(conf)}，
+     * 它的第一道门槛是 {@code UGI.isSecurityEnabled()}；UGI 只看自己的静态配置。
+     * 在我们需要自己登录时会显式调用 {@link UserGroupInformation#setConfiguration}；
+     * 但 Flink 已安装安全上下文时<b>不会</b>再覆盖它，以免破坏 Flink 的 auth_to_local / group mapping 配置。
      *
-     * <p><b>注意</b>：{@code UGI.setConfiguration} 与 {@code loginUserFromKeytab} 都是
-     * JVM 级全局状态，同一 TaskManager 上的多个作业共享。若同 TM 上存在使用不同 principal
-     * 的多个作业，后来的会切换全局登录用户（与原生 HBase 客户端行为一致）。
+     * <p>principal 的 key 名也有坑：HBase 2.2.x 的 {@code AuthUtil} 常量
+     * {@code HBASE_CLIENT_KERBEROS_PRINCIPAL} 的字符串值是
+     * {@code hbase.client.keytab.principal}，而官方文档写的是
+     * {@code hbase.client.kerberos.principal}。只写后者会导致登录被静默跳过，
+     * 因此显式 keytab 模式下两个 key 都写。
      */
     private void applyKerberos(Configuration conf) throws IOException {
         if (!"kerberos".equals(cfg.hbaseSecurityAuthentication)) {
@@ -226,16 +271,21 @@ public class HBaseLookupReader implements LookupReader {
         String keytab = cfg.hbaseClientKeytabFile.trim();
         String principal = cfg.hbaseClientKerberosPrincipal.trim();
 
-        // ---- 0) keytab 可读性 ----
-        // keytab 是 TM 本地文件。提前检查能把「哪台机器、哪个路径不可读」直接写进异常，
-        // 否则只会看到 JAAS 层的 KinitException，排查时还要挨个节点猜。
-        File keytabFile = new File(keytab);
-        if (!keytabFile.isFile() || !keytabFile.canRead()) {
-            throw new IOException("[dual-lookup] keytab 不可读: " + keytab
-                    + "（该文件必须存在于每个 TaskManager 上，且运行用户可读）");
+        // properties.* / hbase-site.xml 里配置的 keytab 同样参与判断。
+        // flink-hbase 正是把 `properties.hbase.client.keytab.file` 原样写进 Configuration，
+        // 再由 HBase 的 AuthUtil 完成登录；这里显式读出来，是为了复用同一套判断与报错逻辑。
+        if (keytab.isEmpty()) {
+            keytab = trimToEmpty(conf.get("hbase.client.keytab.file"));
+        }
+        if (principal.isEmpty()) {
+            principal = trimToEmpty(conf.get("hbase.client.kerberos.principal"));
+            if (principal.isEmpty()) {
+                // HBase 2.2.x 的 AuthUtil 实际读这个 key
+                principal = trimToEmpty(conf.get("hbase.client.keytab.principal"));
+            }
         }
 
-        // ---- 1) krb5.conf ----
+        // ---- 0) krb5.conf ----
         // JVM 级系统属性，必须在第一次 GSS/Kerberos 调用之前生效。
         // 不无脑覆盖：启动脚本若已用 -Djava.security.krb5.conf 指定，就沿用启动参数，
         // 避免同一台 TM 上多个作业互相改写这个全局属性。
@@ -252,24 +302,83 @@ public class HBaseLookupReader implements LookupReader {
             }
         }
 
-        // ---- 2) 配置项 ----
-        // 抽成独立方法：这部分是纯字符串映射，不需要 KDC 就能单测（见 KerberosConfigTest）
-        writeKerberosConfig(conf, keytab, principal);
+        // ---- 1) HBase 侧配置（与凭据来源无关的部分） ----
+        writeKerberosBaseConfig(conf);
 
-        // ---- 3) 把配置交给 UGI（关键一步） ----
-        UserGroupInformation.setConfiguration(conf);
+        // ---- 2) 凭据来源：优先复用 Flink 已登录的 UGI ----
+        // 与 flink-hbase 对齐：Flink 的 HadoopModule 在 TM 启动时就会用
+        // security.kerberos.login.keytab / principal 完成登录，并起一个每分钟的 TGT 续期任务；
+        // flink-hbase 自己不读 keytab，直接用这个已登录的 UGI。
+        // 因此本连接器也把「自己登录」降级成可选项：只有显式配置了 hbase.client.keytab.* 且
+        // 与当前登录用户不一致时才自己登录。
+        UserGroupInformation current = currentUserOrNull();
+        boolean hasKerberosCreds = current != null && current.hasKerberosCredentials();
+
+        if (keytab.isEmpty()) {
+            // 未配置 keytab：完全依赖 Flink 全局登录 / kinit（推荐用法）
+            if (!hasKerberosCreds) {
+                throw new IOException("[dual-lookup] 已开启 Kerberos 但未检测到可用凭据。请二选一："
+                        + "① 推荐（与 flink-hbase 一致）：在 flink-conf.yaml 配置 "
+                        + "security.kerberos.login.keytab / security.kerberos.login.principal；"
+                        + "② 在本表 WITH 里配置 hbase.client.keytab.file / hbase.client.kerberos.principal。"
+                        + "当前 UGI=" + (current == null ? "null" : current.getUserName()));
+            }
+            LOG.info("[dual-lookup] HBase Kerberos 复用已登录用户（Flink 全局登录或 kinit）: {}",
+                    current.getUserName());
+            clearClientKeytabConf(conf);
+            return;
+        }
+
+        // 只有 keytab、没有 principal：无法自己登录。当前已有凭据则复用，否则明确报错。
+        if (principal.isEmpty()) {
+            if (hasKerberosCreds) {
+                LOG.warn("[dual-lookup] 检测到 hbase.client.keytab.file 但缺少 principal，改为复用当前登录用户（{}）。"
+                        + "如需显式登录，请同时配置 hbase.client.kerberos.principal", current.getUserName());
+                clearClientKeytabConf(conf);
+                return;
+            }
+            throw new IOException("[dual-lookup] 配置了 hbase.client.keytab.file 但缺少 principal，"
+                    + "无法执行 keytab 登录；请同时配置 hbase.client.kerberos.principal"
+                    + "（或对应的 properties.hbase.client.kerberos.principal）");
+        }
+
+        // 显式配置了 keytab，但当前用户已经是目标 principal：直接复用
+        if (hasKerberosCreds && principal.equals(current.getUserName())) {
+            LOG.info("[dual-lookup] HBase Kerberos 复用已登录用户（principal 匹配）: {}", principal);
+            clearClientKeytabConf(conf);
+            return;
+        }
+
+        File keytabFile = new File(keytab);
+        if (!keytabFile.isFile() || !keytabFile.canRead()) {
+            // 关键兜底（本次生产问题的修复点）：keytab 可能只存在于部分节点（本次生产就是这种情况），
+            // 而 Flink 已经用全局配置或 delegation token 登录成功时，不应因为「这一张表多写了一个
+            // 只在部分 TM 存在的路径」而让作业起不来。
+            if (hasKerberosCreds) {
+                LOG.warn("[dual-lookup] hbase.client.keytab.file 在本 TaskManager 上不可读（{}），"
+                        + "但当前 UGI 已有 Kerberos 凭据（{}），改为复用之（不会再去读该文件）。"
+                        + "若确实需要该 keytab，请把它分发到每台 TaskManager 的同一路径并保证运行用户可读",
+                        keytab, current.getUserName());
+                clearClientKeytabConf(conf);
+                return;
+            }
+            throw new IOException("[dual-lookup] 未检测到可用 Kerberos 凭据，且 hbase.client.keytab.file 不可读: "
+                    + keytab + "（该文件必须存在于每个 TaskManager 上，且运行用户可读）");
+        }
+
+        // ---- 3) 自己登录（显式覆盖 Flink 的登录用户） ----
+        writeKerberosClientCredentials(conf, keytab, principal);
+        if (!UserGroupInformation.isSecurityEnabled()) {
+            // 只有在我们自己启用安全时才覆盖 UGI 配置；Flink 已安装时保持它的配置不变
+            UserGroupInformation.setConfiguration(conf);
+        }
         if (!UserGroupInformation.isSecurityEnabled()) {
             throw new IOException("[dual-lookup] 已配置 kerberos 但 UGI 仍判定为 simple 模式，"
                     + "keytab 登录会被静默跳过。请确认没有在 JVM 启动参数里强制 simple 认证");
         }
-
-        // ---- 4) 显式 keytab 登录 ----
-        // 注意 UGI.loginUserFromKeytab 的第一行就是 `if (!isSecurityEnabled()) return;`——
-        // 也就是说 security 没开时它会<b>静默返回、不报错</b>。上面第 3 步的断言正是为了
-        // 避免落到这个静默分支里；否则这里看似"登录成功"，实际没有任何凭据。
-        // 不依赖 HBase 内部「是否已登录」的判断：这里登录后，AuthUtil.loginClient 会看到
-        // hasKerberosCredentials=true 且 principal 匹配，直接复用，行为更确定。
         try {
+            // 注意 UGI.loginUserFromKeytab 的第一行是 `if (!isSecurityEnabled()) return;`：
+            // security 未开启时它会静默返回，所以上面必须先断言。
             UserGroupInformation.loginUserFromKeytab(principal, keytab);
         } catch (IOException e) {
             throw new IOException("[dual-lookup] keytab 登录失败, principal=" + principal
@@ -277,27 +386,18 @@ public class HBaseLookupReader implements LookupReader {
                     + "。请先用 klist -kt <keytab> 核对 principal 与 keytab 是否匹配，"
                     + "并确认 TM 与 KDC 时间差在 5 分钟内", e);
         }
-
         LOG.info("[dual-lookup] HBase Kerberos 就绪: principal={}, keytab={}, rpc.protection={}, loginUser={}",
                 principal, keytab, cfg.hbaseRpcProtection, currentUserName());
     }
 
     /**
-     * 把 Kerberos 相关配置项写进 HBase 配置（纯映射，不碰 UGI、不发起登录）。
+     * HBase 侧通用 Kerberos 配置（与凭据来源无关）。
      *
-     * <p>单独抽出来的原因：这是「配了却不生效」的高发区，而验证它不需要 KDC。
-     * 包可见以便单元测试直接断言映射关系（尤其是两个 principal key 都要写）。
+     * <p>纯字符串映射、不需要 KDC，因此抽出来给单测直接断言。
      */
-    void writeKerberosConfig(Configuration conf, String keytab, String principal) {
-        // hadoop.* 决定 UGI 的认证方式；hbase.* 决定 HBase RPC 走 SASL。
-        conf.set("hadoop.security.authentication", "kerberos");
+    void writeKerberosBaseConfig(Configuration conf) {
         conf.set("hbase.security.authentication", "kerberos");
         conf.set("hbase.rpc.protection", cfg.hbaseRpcProtection);
-        // 两个 principal key 都写：2.2.x 的 AuthUtil 实际读 keytab.principal，
-        // 官方文档写 kerberos.principal；只写一个会出现"配了但登录被跳过"。
-        conf.set("hbase.client.keytab.file", keytab);
-        conf.set("hbase.client.keytab.principal", principal);
-        conf.set("hbase.client.kerberos.principal", principal);
         // 服务端 principal：不配时 HBase 默认按 hbase/_HOST@REALM 规则推导，
         // 只有集群改过 principal 名才需要显式指定
         if (!cfg.hbaseRegionserverKerberosPrincipal.trim().isEmpty()) {
@@ -306,6 +406,47 @@ public class HBaseLookupReader implements LookupReader {
         if (!cfg.hbaseMasterKerberosPrincipal.trim().isEmpty()) {
             conf.set("hbase.master.kerberos.principal", cfg.hbaseMasterKerberosPrincipal.trim());
         }
+    }
+
+    /**
+     * 显式 keytab 模式的客户端凭据配置。
+     *
+     * <p>两个 principal key 都写：HBase 2.2.x 的 {@code AuthUtil} 实际读
+     * {@code hbase.client.keytab.principal}，而官方文档写的是
+     * {@code hbase.client.kerberos.principal}；只写一个会出现「配了但登录被跳过」。
+     */
+    void writeKerberosClientCredentials(Configuration conf, String keytab, String principal) {
+        conf.set("hadoop.security.authentication", "kerberos");
+        conf.set("hbase.client.keytab.file", keytab);
+        conf.set("hbase.client.keytab.principal", principal);
+        conf.set("hbase.client.kerberos.principal", principal);
+    }
+
+    /** 当前 UGI；取不到时返回 null（调用方据此判断「没有可用登录用户」） */
+    private static UserGroupInformation currentUserOrNull() {
+        try {
+            return UserGroupInformation.getCurrentUser();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** null 安全的 trim */
+    private static String trimToEmpty(String v) {
+        return v == null ? "" : v.trim();
+    }
+
+    /**
+     * 复用已有 UGI 时清掉客户端 keytab 配置。
+     *
+     * <p>这些 key 可能来自 DDL 的 {@code properties.*} 或 classpath 的 {@code hbase-site.xml}。
+     * 如果保留着，HBase 的 {@code AuthUtil.loginClient} 会认为「用户要求从 keytab 登录」，
+     * 于是再次去读那个可能只存在于部分节点的文件——我们刚刚的复用判断就白做了。
+     */
+    static void clearClientKeytabConf(Configuration conf) {
+        conf.unset("hbase.client.keytab.file");
+        conf.unset("hbase.client.keytab.principal");
+        conf.unset("hbase.client.kerberos.principal");
     }
 
     /** 当前 UGI 用户名，仅用于启动日志；取不到时返回明确的占位符，绝不让日志本身抛异常 */
@@ -317,9 +458,16 @@ public class HBaseLookupReader implements LookupReader {
         }
     }
 
+    /**
+     * 连接是否可用。
+     *
+     * <p>不能只返回 {@code opened}：HBase 侧关闭连接后这个标志仍是 true，
+     * 上层就再也不会调用 {@link #open()}，故障会一直持续到重启作业。
+     */
     @Override
     public boolean isOpened() {
-        return opened;
+        AsyncConnection c = connection;
+        return opened && c != null && !c.isClosed();
     }
 
     /**
@@ -327,7 +475,7 @@ public class HBaseLookupReader implements LookupReader {
      * 顺序不能反：调度器若在连接关闭后仍触发，会在已销毁的连接上做无意义操作。
      */
     @Override
-    public void close() throws Exception {
+    public synchronized void close() throws Exception {
         if (timeoutScheduler != null) {
             timeoutScheduler.shutdownNow();
             timeoutScheduler = null;
@@ -336,6 +484,8 @@ public class HBaseLookupReader implements LookupReader {
             connection.close();
             connection = null;
         }
+        table = null;
+        familyBytes = null;
         opened = false;
     }
 
@@ -351,42 +501,80 @@ public class HBaseLookupReader implements LookupReader {
     @Override
     public CompletableFuture<Map<Integer, List<Map<String, Object>>>> batchLookupAsync(List<Object[]> keys) {
         CompletableFuture<Map<Integer, List<Map<String, Object>>>> result = new CompletableFuture<>();
+        execute(keys, result, true);
+        // 关键：无条件挂上业务层硬超时，保证 Future 一定会终结
+        return withTimeout(result, cfg.timeoutMs);
+    }
 
-        // 过滤空 key，构建批量 Get；indexMap 记录每个 Get 对应的原始下标
-        // 下标映射不可省：过滤掉空 key 后，Get 的下标与入参 keys 的下标就不再一一对应了
-        List<Get> gets = new ArrayList<>();
-        List<Integer> indexMap = new ArrayList<>();
-        for (int i = 0; i < keys.size(); i++) {
-            Object[] k = keys.get(i);
-            if (k == null || k.length == 0 || k[0] == null) {
-                continue; // 主键为空的记录直接跳过：结果里不含该下标，上层按「查不到」处理
-            }
-            Get get = new Get(buildRowKey(k));
-            // 只取需要的列（列投影），减少网络与反序列化开销。
-            // 用构造期预编码好的 columnBytes，避免每个 Get、每一列都重复 Bytes.toBytes
-            for (int c = 0; c < columnBytes.length; c++) {
-                get.addColumn(familyBytes, columnBytes[c]);
-            }
-            gets.add(get);
-            indexMap.add(i);
+    /**
+     * 执行一次批量查询；遇到「连接已关闭」时重建连接并重试一次。
+     *
+     * <p>为什么必须重试：主源正常时 HBase（备源）可能几天都不被调用，连接早已被服务端空闲回收。
+     * 「很久以来第一次降级」正好撞上死连接时，如果直接把 {@code ConnectionClosedException}
+     * 抛给上层，这一批就会失败（两源都失败 → 作业失败），而连接其实重建后立刻可用。
+     *
+     * <p>只重试一次、且只针对连接类异常：普通查询异常（表不存在、权限不足）重试没有意义，
+     * 交给上层降级。
+     *
+     * @param allowRetry 是否允许重连重试（内部递归时置 false，保证最多一次）
+     */
+    private void execute(List<Object[]> keys,
+                         CompletableFuture<Map<Integer, List<Map<String, Object>>>> result,
+                         boolean allowRetry) {
+        if (result.isDone()) {
+            return;
         }
-        if (gets.isEmpty()) {
-            // 整批都无有效 key：直接返回空 Map，连 IO 都不发起
-            result.complete(Collections.emptyMap());
-            return result;
-        }
-
+        // 记录本次查询使用的连接实例：重试时只有「还是这条连接」才关闭重建，
+        // 否则可能把别的线程刚刚重建好的新连接误关掉。
+        final AsyncConnection usedConnection = connection;
         try {
+            AsyncTable<AdvancedScanResultConsumer> currentTable = table;
+            AsyncConnection currentConnection = usedConnection;
+            byte[] family = familyBytes;
+            if (currentTable == null || currentConnection == null
+                    || currentConnection.isClosed() || family == null) {
+                throw new ConnectionClosedException("HBase connection is not open");
+            }
+
+            // 过滤空 key，构建批量 Get；indexMap 记录每个 Get 对应的原始下标
+            // 下标映射不可省：过滤掉空 key 后，Get 的下标与入参 keys 的下标就不再一一对应了
+            List<Get> gets = new ArrayList<>();
+            List<Integer> indexMap = new ArrayList<>();
+            for (int i = 0; i < keys.size(); i++) {
+                Object[] k = keys.get(i);
+                if (k == null || k.length == 0 || k[0] == null) {
+                    continue; // 主键为空的记录直接跳过：结果里不含该下标，上层按「查不到」处理
+                }
+                Get get = new Get(buildRowKey(k));
+                // 只取需要的列（列投影），减少网络与反序列化开销。
+                // 用构造期预编码好的 columnBytes，避免每个 Get、每一列都重复 Bytes.toBytes
+                for (int c = 0; c < columnBytes.length; c++) {
+                    get.addColumn(family, columnBytes[c]);
+                }
+                gets.add(get);
+                indexMap.add(i);
+            }
+            if (gets.isEmpty()) {
+                // 整批都无有效 key：直接返回空 Map，连 IO 都不发起
+                result.complete(Collections.emptyMap());
+                return;
+            }
+
             // HBase 2.x 的 table.get(List<Get>) 返回 List<CompletableFuture<Result>>，
             // 下标与 gets 一一对应，需用 allOf 组合等待全部完成
-            List<CompletableFuture<Result>> futures = table.get(gets);
+            List<CompletableFuture<Result>> futures = currentTable.get(gets);
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                     .whenComplete((v, ex) -> {
                         if (ex != null) {
                             // 任一个 Get 失败（含超时），整批按失败处理，交由上层降级。
                             // 这是「批量语义」的必然取舍：部分成功的结果不完整，用不完整的维表数据
                             // 比走备源重查更危险（会静默产出错误的关联结果）
-                            result.completeExceptionally(unwrap(ex));
+                            Throwable cause = unwrap(ex);
+                            if (allowRetry && isConnectionClosed(cause)) {
+                                retryAsync(keys, result, cause, usedConnection);
+                                return;
+                            }
+                            result.completeExceptionally(cause);
                             return;
                         }
                         Map<Integer, List<Map<String, Object>>> map = new HashMap<>();
@@ -400,12 +588,77 @@ public class HBaseLookupReader implements LookupReader {
                         result.complete(map);
                     });
         } catch (Throwable t) {
-            // table.get() 本身同步抛错（如表不存在、连接已关闭）
+            // table.get() 本身同步抛错（连接已关闭、表不存在等）
+            if (allowRetry && isConnectionClosed(t)) {
+                retryAsync(keys, result, t, usedConnection);
+                return;
+            }
             result.completeExceptionally(t);
         }
+    }
 
-        // 关键：无条件挂上业务层硬超时，保证 Future 一定会终结
-        return withTimeout(result, cfg.timeoutMs);
+    /**
+     * 异步重建连接后重试一次。
+     *
+     * <p>不在 HBase 的回调线程里直接 {@code open()}：那会阻塞 Netty 事件循环。
+     * 放到超时调度器的线程上执行，重连耗时不会计入下一批的 {@code lookup.timeout}
+     * （超时计时器是在 {@code batchLookupAsync} 里才启动的）。
+     */
+    private void retryAsync(List<Object[]> keys,
+                            CompletableFuture<Map<Integer, List<Map<String, Object>>>> result,
+                            Throwable cause,
+                            AsyncConnection failedConnection) {
+        if (result.isDone()) {
+            return;
+        }
+        LOG.warn("[dual-lookup] HBase 连接已断开，重建后重试本批（原因：{}）", cause.toString());
+        ScheduledThreadPoolExecutor scheduler = timeoutScheduler;
+        if (scheduler == null || scheduler.isShutdown()) {
+            result.completeExceptionally(cause);
+            return;
+        }
+        try {
+            scheduler.execute(() -> {
+                if (result.isDone()) {
+                    return;
+                }
+                try {
+                    synchronized (HBaseLookupReader.this) {
+                        // HBase 服务端回收的往往只是底层 RPC 连接，AsyncConnection.isClosed() 仍为 false，
+                        // 所以这里按「实例是否是失败的那一条」来判断，强制替换掉它。
+                        if (connection == failedConnection) {
+                            resetConnection();
+                        }
+                    }
+                    open();
+                } catch (Exception e) {
+                    result.completeExceptionally(e);
+                    return;
+                }
+                execute(keys, result, false);
+            });
+        } catch (RejectedExecutionException e) {
+            result.completeExceptionally(cause);
+        }
+    }
+
+    /** 异常链里是否属于「连接已关闭」这类可以通过重连恢复的错误 */
+    private static boolean isConnectionClosed(Throwable t) {
+        Throwable cur = t;
+        for (int depth = 0; cur != null && depth < 16; depth++) {
+            if (cur instanceof ConnectionClosedException
+                    || cur instanceof java.nio.channels.ClosedChannelException) {
+                return true;
+            }
+            String msg = cur.getMessage();
+            if (msg != null && (msg.contains("Connection closed")
+                    || msg.contains("Connection reset")
+                    || msg.contains("connection is closed"))) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     /**

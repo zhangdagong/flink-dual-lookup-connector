@@ -39,7 +39,9 @@ public class KerberosConfigTest {
     @Test
     public void writesBothPrincipalKeysAndAuthenticationMode() {
         org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
-        reader(kerberosConfig()).writeKerberosConfig(hconf, "/k.keytab", "ro@EXAMPLE.COM");
+        HBaseLookupReader r = reader(kerberosConfig());
+        r.writeKerberosBaseConfig(hconf);
+        r.writeKerberosClientCredentials(hconf, "/k.keytab", "ro@EXAMPLE.COM");
 
         // HBase 2.2.x 实际读取的 key；漏写它 = keytab 登录被静默跳过
         assertEquals("ro@EXAMPLE.COM", hconf.get("hbase.client.keytab.principal"));
@@ -57,6 +59,20 @@ public class KerberosConfigTest {
         assertEquals("hbase/_HOST@EXAMPLE.COM", hconf.get("hbase.regionserver.kerberos.principal"));
     }
 
+    /**
+     * 只写 HBase 侧配置时（复用 Flink 全局登录的路径），不应把客户端 keytab key 也写进去——
+     * 否则 HBase 的 AuthUtil 会认为「用户要求从 keytab 登录」，反而可能覆盖/重置全局 UGI。
+     */
+    @Test
+    public void baseConfigDoesNotBindClientKeytab() {
+        org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
+        reader(kerberosConfig()).writeKerberosBaseConfig(hconf);
+
+        assertEquals("kerberos", hconf.get("hbase.security.authentication"));
+        assertEquals(null, hconf.get("hbase.client.keytab.file"));
+        assertEquals(null, hconf.get("hbase.client.keytab.principal"));
+    }
+
     @Test
     public void rpcProtectionIsPropagated() {
         Configuration c = new Configuration();
@@ -67,10 +83,27 @@ public class KerberosConfigTest {
         c.setString(DualLookupOptions.HBASE_RPC_PROTECTION.key(), "privacy");
 
         org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
-        reader(DualLookupOptions.Config.from(c, "dim_account"))
-                .writeKerberosConfig(hconf, "/k.keytab", "ro@EXAMPLE.COM");
+        reader(DualLookupOptions.Config.from(c, "dim_account")).writeKerberosBaseConfig(hconf);
 
         // 服务端要求 privacy 而客户端还是默认 authentication 时，握手阶段才失败，极难定位
         assertEquals("privacy", hconf.get("hbase.rpc.protection"));
+    }
+
+    /**
+     * 复用已有 UGI 时必须清掉客户端 keytab 配置：否则 HBase 的 AuthUtil 会认为用户要求从 keytab
+     * 登录，再次去读那个可能只存在于部分 TM 的文件，复用判断就失效了。
+     */
+    @Test
+    public void reuseModeClearsClientKeytabConfig() {
+        org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
+        hconf.set("hbase.client.keytab.file", "/only/on/some/tms/ro.keytab");
+        hconf.set("hbase.client.keytab.principal", "ro@EXAMPLE.COM");
+        hconf.set("hbase.client.kerberos.principal", "ro@EXAMPLE.COM");
+
+        HBaseLookupReader.clearClientKeytabConf(hconf);
+
+        assertEquals(null, hconf.get("hbase.client.keytab.file"));
+        assertEquals(null, hconf.get("hbase.client.keytab.principal"));
+        assertEquals(null, hconf.get("hbase.client.kerberos.principal"));
     }
 }

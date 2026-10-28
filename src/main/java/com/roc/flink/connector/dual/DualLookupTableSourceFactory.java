@@ -8,8 +8,10 @@ import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -32,6 +34,9 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         return DualLookupOptions.CONNECTOR_ID;
     }
 
+    /** 与 flink-hbase 一致的 HBase 客户端属性透传前缀 */
+    private static final String PROPERTIES_PREFIX = "properties.";
+
     /**
      * 由 DDL 构建 TableSource。本方法在建表阶段（SQL 解析/校验期）被调用，
      * 因此这里抛出的异常会立刻反馈给用户，而不是等到作业运行才暴露。
@@ -39,8 +44,10 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
     @Override
     public DynamicTableSource createDynamicTableSource(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
-        // validate() 会做两件事：(1) 检查是否漏了必填项；(2) 检查是否出现未声明的 key（防拼写错误，如 lookup.timeoutt）
-        helper.validate();
+        // 与 flink-hbase 保持一致：properties.* 是原样透传给 HBase 客户端配置的，不参与本连接器校验。
+        // flink-hbase 的写法就是 helper.validateExcept("properties.")，因此
+        // 'properties.hbase.client.keytab.file' 这类参数在两边都可以直接使用。
+        helper.validateExcept(PROPERTIES_PREFIX);
 
         // 主键强校验：Lookup Join 的本质是「按 key 点查」，没有主键就无法构成点查语义，
         // 提前拦下比运行期报错更友好
@@ -63,7 +70,15 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         String[] fieldNames = nameList.toArray(new String[0]);
         LogicalType[] fieldTypes = typeList.toArray(new LogicalType[0]);
 
-        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(config, tableName);
+        // 收集 properties.* 透传项（去掉前缀），运行期写入 HBase Configuration
+        Map<String, String> hbaseProperties = new HashMap<>();
+        for (Map.Entry<String, String> option : context.getCatalogTable().getOptions().entrySet()) {
+            if (option.getKey().startsWith(PROPERTIES_PREFIX)) {
+                hbaseProperties.put(option.getKey().substring(PROPERTIES_PREFIX.length()), option.getValue());
+            }
+        }
+
+        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(config, tableName, hbaseProperties);
         return new DualLookupTableSource(cfg, tableName, fieldNames, fieldTypes);
     }
 

@@ -6,6 +6,9 @@ import org.apache.flink.configuration.ReadableConfig;
 
 import java.io.Serializable;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * dual-lookup connector 的全部配置项 + 解析后的配置值对象。
@@ -244,12 +247,17 @@ public final class DualLookupOptions {
                     .stringType()
                     .defaultValue("authentication");
 
-    /** 客户端 keytab 文件路径（kerberos 下必填） */
+    /**
+     * 客户端 keytab 文件路径（<b>可选</b>）。
+     *
+     * <p>不配置时复用 Flink 全局登录（{@code security.kerberos.login.keytab/principal}）或 kinit 凭据——
+     * 这与 flink-hbase 的行为一致；配置时用于「单表覆盖全局登录用户」。与 principal 必须成对出现。
+     */
     public static final ConfigOption<String> HBASE_CLIENT_KEYTAB_FILE =
             ConfigOptions.key("hbase.client.keytab.file").stringType().noDefaultValue();
 
     /**
-     * 客户端 Kerberos principal，形如 {@code ro@EXAMPLE.COM}（kerberos 下必填）。
+     * 客户端 Kerberos principal，形如 {@code ro@EXAMPLE.COM}（<b>可选</b>，与 keytab 成对）。
      *
      * <p><b>为什么这里叫 kerberos.principal 而运行期要写两个 key？</b>
      * HBase 2.2.x 的 {@code AuthUtil.loginClient()} 实际读取的常量值却是
@@ -258,7 +266,7 @@ public final class DualLookupOptions {
      * 只写文档里那个 key 时，{@code shouldLoginFromKeytab()} 会判定"没配 principal"，
      * 于是 keytab 自动登录被静默跳过——这正是"配了 Kerberos 却始终认证不上"的常见原因。
      *
-     * <p>因此 {@code HBaseLookupReader} 会把同一个值同时写入两个 key，两种读法都能命中。
+     * <p>因此 {@code HBaseLookupReader} 在显式 keytab 模式下会把同一个值同时写入两个 key。
      *
      * <p><b>注意：客户端 principal 必须是具体账号，不能含 {@code _HOST}</b>。
      * {@code _HOST} 是服务端（RS/Master）principal 的占位符，客户端用它登录只会失败，
@@ -398,6 +406,14 @@ public final class DualLookupOptions {
         public String hbaseRegionserverKerberosPrincipal;
         public String hbaseMasterKerberosPrincipal;
         public String hbaseKrb5Conf;
+        /**
+         * DDL 里 {@code properties.*} 透传的 HBase 客户端配置（前缀已去掉）。
+         *
+         * <p>与 flink-hbase 完全一致：它的工厂用 {@code helper.validateExcept("properties.")} 放行，
+         * 再由 {@code HBaseConnectorOptionsUtil.getHBaseConfiguration()} 逐项写入 HBase Configuration。
+         * 这样迁移过来的 DDL 可以原样写 {@code 'properties.hbase.client.keytab.file'} 等参数。
+         */
+        public Map<String, String> hbaseProperties;
 
         public String dorisJdbcUrl;
         public String dorisTableName;
@@ -424,7 +440,18 @@ public final class DualLookupOptions {
          * @throws IllegalArgumentException 配置不合法时抛出，Flink 会在建表阶段直接失败并打印原因
          */
         public static Config from(ReadableConfig c, String ddlTableName) {
+            return from(c, ddlTableName, Collections.<String, String>emptyMap());
+        }
+
+        /**
+         * 读取并校验全部配置，并接收 {@code properties.*} 透传项。
+         *
+         * @param hbaseProperties DDL 中 {@code properties.xxx} 去掉前缀后的键值对（可为空但不为 null）
+         */
+        public static Config from(ReadableConfig c, String ddlTableName, Map<String, String> hbaseProperties) {
             Config cfg = new Config();
+            cfg.hbaseProperties = new HashMap<>(
+                    hbaseProperties == null ? Collections.<String, String>emptyMap() : hbaseProperties);
 
             // ---- 主备路由：只声明主源，备源由代码推导，避免用户配出「主备同源」的无效组合 ----
             cfg.primary = normalize(c.get(PRIMARY));
@@ -540,19 +567,21 @@ public final class DualLookupOptions {
             if (cfg.dorisJdbcUrl == null || cfg.dorisJdbcUrl.trim().isEmpty()) {
                 throw new IllegalArgumentException("[dual-lookup] doris.jdbc-url 必填");
             }
-            // Kerberos 模式：keytab 与 principal 必须成对出现，缺一无法完成登录。
-            // 这两个参数不配的后果是「静默回退到 kinit 凭据」——在 Flink TM 上通常没有 TGT，
-            // 表现为连接阶段 SASL 失败，而日志不会提示"你少配了 keytab"，因此必须建表期拦住。
+            // Kerberos 模式：keytab 与 principal 允许都不配置。
+            // 不配置时复用 Flink 全局登录（security.kerberos.login.keytab/principal）或 kinit 凭据，
+            // 这与 flink-hbase 的行为一致：flink-hbase 自己不读 keytab，直接用 Flink 已登录的 UGI。
+            // 但只配一半（有 keytab 没 principal，或反之）无法完成登录，必须建表期拦下。
             if ("kerberos".equals(cfg.hbaseSecurityAuthentication)) {
-                if (cfg.hbaseClientKeytabFile.trim().isEmpty()
-                        || cfg.hbaseClientKerberosPrincipal.trim().isEmpty()) {
+                boolean hasKeytab = !cfg.hbaseClientKeytabFile.trim().isEmpty();
+                boolean hasPrincipal = !cfg.hbaseClientKerberosPrincipal.trim().isEmpty();
+                if (hasKeytab != hasPrincipal) {
                     throw new IllegalArgumentException(
-                            "[dual-lookup] hbase.security.authentication=kerberos 时，"
-                                    + "hbase.client.keytab.file 与 hbase.client.kerberos.principal 必填");
+                            "[dual-lookup] hbase.client.keytab.file 与 hbase.client.kerberos.principal "
+                                    + "要么都配置，要么都不配置（都不配时复用 Flink 全局登录 / kinit 凭据）");
                 }
                 // _HOST 只适用于服务端 principal（hbase/_HOST@REALM）。客户端 principal 写了它，
                 // 登录必然失败，且失败信息是 GSS/kinit 层面的，和"写错占位符"毫无关联，极难排查。
-                if (cfg.hbaseClientKerberosPrincipal.contains("_HOST")) {
+                if (hasPrincipal && cfg.hbaseClientKerberosPrincipal.contains("_HOST")) {
                     throw new IllegalArgumentException(
                             "[dual-lookup] hbase.client.kerberos.principal 必须是具体账号"
                                     + "（如 ro@EXAMPLE.COM），不能使用服务端占位符 _HOST，当前为: "
