@@ -15,7 +15,7 @@ import static org.junit.Assert.assertEquals;
  *
  * <p>覆盖的是「不接 KDC 也能验证」的那部分——也就是最容易出错、又最难在集群上定位的那部分：
  * 配置项到 Hadoop/HBase key 的映射关系。真实登录（kinit/keytab）依赖 KDC，无法在单测里完成，
- * 由 README 第 7 章的手工核验步骤覆盖。
+ * 由 README 第 9 章的手工核验步骤覆盖。
  *
  * <p>核心回归点：HBase 2.2.x 的 {@code AuthUtil} 读取的 principal key 是
  * {@code hbase.client.keytab.principal}，而文档写的是 {@code hbase.client.kerberos.principal}。
