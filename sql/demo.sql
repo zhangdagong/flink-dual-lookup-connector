@@ -204,9 +204,7 @@ CREATE TABLE trans_detail_sink (
 --    多张维表 join 时每张各写一条 hint，全部放在 SELECT 之后。
 -- -----------------------------------------------------------------------------
 INSERT INTO trans_detail_sink
-SELECT /*+ LOOKUP('table' = 'm1', 'async' = 'true',
-                   'output-mode' = 'allow_unordered',
-                   'capacity' = '200', 'timeout' = '10s') */
+SELECT /*+ LOOKUP('table' = 'm1', 'async' = 'true', 'output-mode' = 'allow_unordered', 'capacity' = '200', 'timeout' = '10s') */
     t1.trans_jnls_no,
     t1.account_no,
     t1.trans_time,
