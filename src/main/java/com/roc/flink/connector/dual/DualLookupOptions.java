@@ -2,6 +2,7 @@ package com.roc.flink.connector.dual;
 
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
 
 import java.io.Serializable;
@@ -77,6 +78,10 @@ public final class DualLookupOptions {
      * <p>调优建议：取值应略大于主源 P99 延迟，否则会把正常抖动误判为故障、频繁降级；
      * 同时必须让算子层兜底 {@code table.exec.async-lookup.timeout} 显著大于它（经验值 ×2 + 2s），
      * 否则降级还没走完，Flink 自己就先抛超时异常了。
+     *
+     * <p><b>联动推导</b>：显式设置本项后，未显式配置的依赖项会自动跟随：
+     * {@code hbase.rpc.timeout = 80%}、{@code hbase.client.operation.timeout = max(500, 本值)}、
+     * {@code doris.connect.timeout = 80% 并夹到 [250,300]ms}。显式写了的参数优先，不会被覆盖。
      */
     public static final ConfigOption<Integer> LOOKUP_TIMEOUT =
             ConfigOptions.key("lookup.timeout")
@@ -209,7 +214,11 @@ public final class DualLookupOptions {
     public static final ConfigOption<String> HBASE_ROWKEY_ENCODING =
             ConfigOptions.key("hbase.rowkey.encoding").stringType().defaultValue("string");
 
-    /** 单次 RPC 超时（毫秒）：让 HBase 客户端尽早中断一次 RPC，快速把控制权交回业务层降级 */
+    /**
+     * 单次 RPC 超时（毫秒）：让 HBase 客户端尽早中断一次 RPC，快速把控制权交回业务层降级。
+     *
+     * <p>显式设置 {@code lookup.timeout} 且本项未显式设置时，自动取 80%（留 20% 给降级判定）。
+     */
     public static final ConfigOption<Integer> HBASE_RPC_TIMEOUT_MS =
             ConfigOptions.key("hbase.rpc.timeout").intType().defaultValue(300);
 
@@ -218,6 +227,9 @@ public final class DualLookupOptions {
      *
      * <p>注意这个值可以大于 {@link #LOOKUP_TIMEOUT}：它的作用是让 HBase 客户端别「太快」放弃，
      * 真正的降级判断由业务层超时负责；两者职责不同，不要用同一个值去理解。
+     *
+     * <p>显式设置 {@code lookup.timeout} 且本项未显式设置时，自动取 {@code max(500, lookup.timeout)}，
+     * 避免 HBase 先于业务层放弃。
      */
     public static final ConfigOption<Integer> HBASE_OPERATION_TIMEOUT_MS =
             ConfigOptions.key("hbase.client.operation.timeout").intType().defaultValue(500);
@@ -252,6 +264,10 @@ public final class DualLookupOptions {
      *
      * <p>不配置时复用 Flink 全局登录（{@code security.kerberos.login.keytab/principal}）或 kinit 凭据——
      * 这与 flink-hbase 的行为一致；配置时用于「单表覆盖全局登录用户」。与 principal 必须成对出现。
+     *
+     * <p>也可以用 {@code properties.hbase.client.keytab.file} 提供，两者等价（显式参数优先）。
+     * <b>注意 {@code hbase.master.keytab.file} 是 HBase Master 服务端配置，不是客户端凭据</b>，
+     * 连接器不会拿它登录；从 flink-hbase 迁移时若只写了它，应改用本参数或直接复用 Flink 全局登录。
      */
     public static final ConfigOption<String> HBASE_CLIENT_KEYTAB_FILE =
             ConfigOptions.key("hbase.client.keytab.file").stringType().noDefaultValue();
@@ -271,6 +287,9 @@ public final class DualLookupOptions {
      * <p><b>注意：客户端 principal 必须是具体账号，不能含 {@code _HOST}</b>。
      * {@code _HOST} 是服务端（RS/Master）principal 的占位符，客户端用它登录只会失败，
      * 且报错信息与根因相距很远，故在建表阶段直接拦下。
+     *
+     * <p>也可以用 {@code properties.hbase.client.kerberos.principal}（或 HBase 2.2.x 实际读取的
+     * {@code properties.hbase.client.keytab.principal}）提供，显式参数优先。
      */
     public static final ConfigOption<String> HBASE_CLIENT_KERBEROS_PRINCIPAL =
             ConfigOptions.key("hbase.client.kerberos.principal").stringType().noDefaultValue();
@@ -310,25 +329,32 @@ public final class DualLookupOptions {
             ConfigOptions.key("doris.driver").stringType().defaultValue("com.mysql.cj.jdbc.Driver");
 
     /**
-     * JDBC Statement 的 queryTimeout（秒），服务端侧兜底。
+     * JDBC Statement 的 queryTimeout（秒）。
      *
-     * <p>运行期会被自动钳制到 {@code <= ceil(lookup.timeout/1000)}，防止「业务层已超时降级、
-     * 但 JDBC 还在傻等」导致连接与线程被慢查询长期占用。详见 {@code DorisLookupReader.batchLookupAsync}。
+     * <p><b>0（默认）</b>：不调用 {@code Statement.setQueryTimeout}，由 Doris 集群/会话的
+     * {@code query_timeout} 等默认机制控制；业务层的 {@code lookup.timeout} 仍然是降级判据，
+     * 到点会调用 {@code Statement.cancel()} 主动中止 SQL。
+     *
+     * <p><b>&gt;0</b>：显式设置 JDBC queryTimeout，且<b>不再被 lookup.timeout 钳制</b>。
+     * 需要更长的 Doris 服务端超时就直接配大；业务超时仍由 lookup.timeout 独立控制。
      */
     public static final ConfigOption<Integer> DORIS_QUERY_TIMEOUT_SEC =
-            ConfigOptions.key("doris.query.timeout").intType().defaultValue(1);
+            ConfigOptions.key("doris.query.timeout").intType().defaultValue(0);
 
     // ---- 连接池（HikariCP）调优项 ----
 
     /**
-     * 连接池最大连接数；Doris 作主源时建议调大（如 16）。
+     * 连接池最大连接数（默认 4）；Doris 作主源时建议调大（如 16）。
      *
      * <p>注意容量要按维表份数规划：同一作业里每张 dual-lookup 维表都有独立的连接池，
      * Doris 侧总连接数 = Σ（每表算子并行度 × 每表 pool.size）。多表 join 时别把每张表
      * 都按单表标准配，码表类小维表降到 2~4 即可。
+     *
+     * <p>默认值取 4 而不是 8：Doris 在多数部署里是备源，长期空闲，没必要为每张表预留
+     * 8 个连接；4 仍能满足「并行查询 + 连接自愈」的基本盘，Doris 作主源时再显式调到 8~16。
      */
     public static final ConfigOption<Integer> DORIS_POOL_SIZE =
-            ConfigOptions.key("doris.pool.size").intType().defaultValue(8);
+            ConfigOptions.key("doris.pool.size").intType().defaultValue(4);
 
     /** 连接池最小空闲连接数；必须 <= {@link #DORIS_POOL_SIZE}，否则启动即报错 */
     public static final ConfigOption<Integer> DORIS_POOL_MIN_IDLE =
@@ -341,6 +367,9 @@ public final class DualLookupOptions {
      * 若连接池被打满时业务层先超时，整批就直接失败了。校验规则会拒绝「大于等于 lookup.timeout」的取值。
      *
      * <p>下限受 HikariCP 约束，不能小于 250ms。
+     *
+     * <p>显式设置 {@code lookup.timeout} 且本项未显式设置时，自动取 80% 并夹到 [250, 300]ms：
+     * 80% 保证池先于业务层失败，300ms 上限则避免最后一跳把预算全花在等连接上。
      */
     public static final ConfigOption<Integer> DORIS_CONNECT_TIMEOUT_MS =
             ConfigOptions.key("doris.connect.timeout").intType().defaultValue(300);
@@ -428,6 +457,22 @@ public final class DualLookupOptions {
         public int dorisPoolMaxLifetimeMs;
         public int dorisPoolValidationTimeoutMs;
 
+        /** lookup.timeout 显式设置时，未显式配置的 hbase.rpc.timeout 自动取 80% */
+        private static final double HBASE_RPC_TIMEOUT_RATIO = 0.8;
+        /** hbase.client.operation.timeout 自动推导时的下限（保留冷启动 region 定位余量） */
+        private static final int HBASE_OPERATION_TIMEOUT_MIN_MS = 500;
+        /**
+         * Doris 取连接超时的自动化比例。
+         *
+         * <p>虽然 80% 能保证「池先失败、业务再降级」，但 Doris 是最后一跳：
+         * 等待连接就花掉 80% 的话，留给 SQL 执行的时间只剩 20%。
+         * 因此 80% 只作为上限参考，再夹到 [250, 300]ms——250 是 HikariCP 的下限，
+         * 300 是原默认值，避免大 timeout 场景把预算全花在等连接上。
+         */
+        private static final double DORIS_CONNECT_TIMEOUT_RATIO = 0.8;
+        private static final int DORIS_CONNECT_TIMEOUT_MIN_MS = 250;
+        private static final int DORIS_CONNECT_TIMEOUT_MAX_MS = 300;
+
         /** 私有构造：只允许通过 {@link #from} 创建，防止出现「字段没赋值就被使用」的半成品对象 */
         private Config() {}
 
@@ -440,7 +485,7 @@ public final class DualLookupOptions {
          * @throws IllegalArgumentException 配置不合法时抛出，Flink 会在建表阶段直接失败并打印原因
          */
         public static Config from(ReadableConfig c, String ddlTableName) {
-            return from(c, ddlTableName, Collections.<String, String>emptyMap());
+            return from(c, ddlTableName, Collections.<String, String>emptyMap(), null);
         }
 
         /**
@@ -449,6 +494,20 @@ public final class DualLookupOptions {
          * @param hbaseProperties DDL 中 {@code properties.xxx} 去掉前缀后的键值对（可为空但不为 null）
          */
         public static Config from(ReadableConfig c, String ddlTableName, Map<String, String> hbaseProperties) {
+            return from(c, ddlTableName, hbaseProperties, null);
+        }
+
+        /**
+         * 读取并校验全部配置。
+         *
+         * @param globalConfig Session 级配置，即 {@code SET 'table.exec.async-lookup.timeout' = '10s'} 所在的那份配置。
+         *                     这个 key 不在 CatalogTable 的 WITH 选项里，必须由 Factory 从
+         *                     {@code context.getConfiguration()} 单独传入；否则第 (4) 条交叉校验
+         *                     只能拿到 Flink 默认的 3 分钟，用户把算子超时调小也发现不了。
+         *                     传 null 时退回 {@code c}（单测与旧调用路径）。
+         */
+        public static Config from(ReadableConfig c, String ddlTableName,
+                                  Map<String, String> hbaseProperties, ReadableConfig globalConfig) {
             Config cfg = new Config();
             cfg.hbaseProperties = new HashMap<>(
                     hbaseProperties == null ? Collections.<String, String>emptyMap() : hbaseProperties);
@@ -457,6 +516,8 @@ public final class DualLookupOptions {
             cfg.primary = normalize(c.get(PRIMARY));
             cfg.standby = SRC_HBASE.equals(cfg.primary) ? SRC_DORIS : SRC_HBASE;
             cfg.timeoutMs = c.get(LOOKUP_TIMEOUT);
+            // 只有用户显式调过 lookup.timeout，才联动推导其他超时；用默认 500 时保持原有默认值
+            boolean lookupTimeoutExplicit = hasExplicit(c, LOOKUP_TIMEOUT);
 
             cfg.batchSize = c.get(BATCH_SIZE);
             cfg.batchMaxWaitMs = c.get(BATCH_MAX_WAIT);
@@ -474,10 +535,42 @@ public final class DualLookupOptions {
             cfg.hbaseRpcTimeoutMs = c.get(HBASE_RPC_TIMEOUT_MS);
             cfg.hbaseOperationTimeoutMs = c.get(HBASE_OPERATION_TIMEOUT_MS);
             cfg.hbaseRetries = c.get(HBASE_RETRIES);
-            cfg.hbaseSecurityAuthentication = normalizeAuthentication(c.get(HBASE_SECURITY_AUTHENTICATION));
-            cfg.hbaseRpcProtection = normalizeRpcProtection(c.get(HBASE_RPC_PROTECTION));
+            // 兼容 flink-hbase 的写法：properties.hbase.security.authentication / rpc.protection
+            // 只在显式参数没写时生效（显式参数优先级更高）。
+            // 这一步很关键：迁移过来的 DDL 往往只写 properties.*，如果这里仍按显式参数的默认值
+            // 判成 simple，applyKerberos() 会直接 return，整套 Kerberos 逻辑都被跳过。
+            String authentication = c.get(HBASE_SECURITY_AUTHENTICATION);
+            if (!hasExplicit(c, HBASE_SECURITY_AUTHENTICATION)) {
+                String fromProperties = cfg.hbaseProperties.get("hbase.security.authentication");
+                if (fromProperties != null && !fromProperties.trim().isEmpty()) {
+                    authentication = fromProperties;
+                }
+            }
+            cfg.hbaseSecurityAuthentication = normalizeAuthentication(authentication);
+
+            String rpcProtection = c.get(HBASE_RPC_PROTECTION);
+            if (!hasExplicit(c, HBASE_RPC_PROTECTION)) {
+                String fromProperties = cfg.hbaseProperties.get("hbase.rpc.protection");
+                if (fromProperties != null && !fromProperties.trim().isEmpty()) {
+                    rpcProtection = fromProperties;
+                }
+            }
+            cfg.hbaseRpcProtection = normalizeRpcProtection(rpcProtection);
+
+            // 客户端 keytab/principal 同样允许由 properties.* 提供（与 flink-hbase 对齐）。
+            // 注意 hbase.master.keytab.file 是 HBase Master 服务端配置，绝不能当成客户端凭据；
+            // 这里只认 hbase.client.*，master 相关的 key 原样透传给 HBase Configuration 即可。
             cfg.hbaseClientKeytabFile = c.getOptional(HBASE_CLIENT_KEYTAB_FILE).orElse("");
+            if (cfg.hbaseClientKeytabFile.trim().isEmpty()) {
+                cfg.hbaseClientKeytabFile = firstNonEmpty(
+                        cfg.hbaseProperties.get("hbase.client.keytab.file"));
+            }
             cfg.hbaseClientKerberosPrincipal = c.getOptional(HBASE_CLIENT_KERBEROS_PRINCIPAL).orElse("");
+            if (cfg.hbaseClientKerberosPrincipal.trim().isEmpty()) {
+                cfg.hbaseClientKerberosPrincipal = firstNonEmpty(
+                        cfg.hbaseProperties.get("hbase.client.kerberos.principal"),
+                        cfg.hbaseProperties.get("hbase.client.keytab.principal"));
+            }
             cfg.hbaseRegionserverKerberosPrincipal = c.getOptional(HBASE_REGIONSERVER_KERBEROS_PRINCIPAL).orElse("");
             cfg.hbaseMasterKerberosPrincipal = c.getOptional(HBASE_MASTER_KERBEROS_PRINCIPAL).orElse("");
             cfg.hbaseKrb5Conf = c.getOptional(HBASE_KRB5_CONF).orElse("");
@@ -495,16 +588,36 @@ public final class DualLookupOptions {
             cfg.dorisPoolMaxLifetimeMs = c.get(DORIS_POOL_MAX_LIFETIME_MS);
             cfg.dorisPoolValidationTimeoutMs = c.get(DORIS_POOL_VALIDATION_TIMEOUT_MS);
 
+            // 显式调小/调大 lookup.timeout 时，未显式配置的依赖项跟着推导，避免「只改一个参数建表就失败」
+            applyDerivedTimeouts(c, cfg, lookupTimeoutExplicit);
+
             // ---- 跨字段校验：单看一个 ConfigOption 无法发现的错误组合，统一在这里拦截 ----
 
             // 超时为 0/负数会让「超时降级」永不触发，等同于容错机制失效，必须拒绝
             if (cfg.timeoutMs <= 0) {
                 throw new IllegalArgumentException("[dual-lookup] lookup.timeout 必须大于 0");
             }
+            // 未显式配置 doris.connect.timeout 时，自动推导会被 HikariCP 的 250ms 下限顶住，
+            // 无法再满足 < lookup.timeout；这里给出比通用校验更可操作的提示。
+            if (lookupTimeoutExplicit && !hasExplicit(c, DORIS_CONNECT_TIMEOUT_MS)
+                    && cfg.timeoutMs <= DORIS_CONNECT_TIMEOUT_MIN_MS) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] lookup.timeout(" + cfg.timeoutMs + "ms) 必须大于 "
+                                + DORIS_CONNECT_TIMEOUT_MIN_MS + "ms：未显式配置 doris.connect.timeout 时，"
+                                + "连接器会自动取 80% 并夹到 [250, 300]ms；而 250ms 是 HikariCP 的 "
+                                + "connectionTimeout 下限，无法同时满足 < lookup.timeout。"
+                                + "请调大 lookup.timeout，或显式配置 doris.connect.timeout（仍需 >= 250ms）");
+            }
             // 攒批条数为 0 会导致批永远发不出去（攒不满）；
             // 等待时间为负则等价于「不做时间兜底」，低流量下延迟会无界增长
             if (cfg.batchSize <= 0 || cfg.batchMaxWaitMs < 0) {
                 throw new IllegalArgumentException("[dual-lookup] lookup.batch.size 必须大于 0，batch.max-wait 不能为负");
+            }
+            // 0 表示不设置 JDBC queryTimeout，交给 Doris 集群/会话默认；负数没有意义
+            if (cfg.dorisQueryTimeoutSec < 0) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] doris.query.timeout 不能为负：0 表示使用 Doris 集群/会话默认，"
+                                + "大于 0 表示显式 JDBC 超时（秒）");
             }
             // 负间隔没有意义（0 已经表达了「不限流」这个语义），拦下来避免被当成「关闭日志」误用
             if (cfg.failoverLogIntervalSec < 0) {
@@ -537,6 +650,11 @@ public final class DualLookupOptions {
             }
             // (3) Doris 取连接超时必须小于业务超时：Doris 是备源、后面没有第三次降级机会，
             //     连接池被打满时若业务层先超时，这一批就直接失败了
+            if (cfg.dorisConnectTimeoutMs < DORIS_CONNECT_TIMEOUT_MIN_MS) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] doris.connect.timeout(" + cfg.dorisConnectTimeoutMs + "ms) 不能小于 "
+                                + DORIS_CONNECT_TIMEOUT_MIN_MS + "ms，这是 HikariCP 的硬性下限");
+            }
             if (cfg.dorisConnectTimeoutMs >= cfg.timeoutMs) {
                 throw new IllegalArgumentException(
                         "[dual-lookup] doris.connect.timeout(" + cfg.dorisConnectTimeoutMs + "ms) 必须小于 "
@@ -545,7 +663,9 @@ public final class DualLookupOptions {
             }
             // (4) 算子层兜底超时必须大于业务超时：否则降级还没走完，Flink 的异步算子自己就先判超时了，
             //     容错逻辑形同虚设。该值是 Flink 全局配置，读不到时会取 Flink 自身的默认值
-            long asyncLookupTimeoutMs = c.get(ASYNC_LOOKUP_TIMEOUT).toMillis();
+            ReadableConfig asyncConfig =
+                    (globalConfig != null && hasExplicit(globalConfig, ASYNC_LOOKUP_TIMEOUT)) ? globalConfig : c;
+            long asyncLookupTimeoutMs = asyncConfig.get(ASYNC_LOOKUP_TIMEOUT).toMillis();
             if (asyncLookupTimeoutMs <= cfg.timeoutMs) {
                 throw new IllegalArgumentException(
                         "[dual-lookup] table.exec.async-lookup.timeout(" + asyncLookupTimeoutMs + "ms) 必须大于 "
@@ -589,6 +709,60 @@ public final class DualLookupOptions {
                 }
             }
             return cfg;
+        }
+
+        /**
+         * 根据显式设置的 {@code lookup.timeout} 推导未显式配置的依赖超时。
+         *
+         * <p>只改一个 {@code lookup.timeout} 就建表失败，是很常见的运维摩擦：
+         * 例如把它调到 1000ms 时，默认的 {@code hbase.rpc.timeout=300} 仍然合法但偏小；
+         * 调到 300ms 时，默认的 300ms 反而会让交叉校验失败。这里在用户没显式指定时自动跟随：
+         * <ul>
+         *   <li>{@code hbase.rpc.timeout} = 80% × lookup.timeout（留 20% 给降级判定）；</li>
+         *   <li>{@code hbase.client.operation.timeout} = max(500, lookup.timeout)，避免 HBase 先于业务超时放弃；</li>
+         *   <li>{@code doris.connect.timeout} = 80% × lookup.timeout，夹到 [250, 300]ms（HikariCP 下限 + 最后一跳留出 SQL 时间）。</li>
+         * </ul>
+         *
+         * <p>用户显式写了任何一项，就以显式值为准，不再覆盖。
+         */
+        private static void applyDerivedTimeouts(ReadableConfig c, Config cfg, boolean lookupTimeoutExplicit) {
+            if (!lookupTimeoutExplicit) {
+                return;
+            }
+            if (!hasExplicit(c, HBASE_RPC_TIMEOUT_MS)) {
+                cfg.hbaseRpcTimeoutMs = (int) Math.max(1L,
+                        Math.round(cfg.timeoutMs * HBASE_RPC_TIMEOUT_RATIO));
+            }
+            if (!hasExplicit(c, HBASE_OPERATION_TIMEOUT_MS)) {
+                cfg.hbaseOperationTimeoutMs = Math.max(HBASE_OPERATION_TIMEOUT_MIN_MS, cfg.timeoutMs);
+            }
+            if (!hasExplicit(c, DORIS_CONNECT_TIMEOUT_MS)) {
+                long derived = Math.round(cfg.timeoutMs * DORIS_CONNECT_TIMEOUT_RATIO);
+                cfg.dorisConnectTimeoutMs = (int) Math.max(DORIS_CONNECT_TIMEOUT_MIN_MS,
+                        Math.min(DORIS_CONNECT_TIMEOUT_MAX_MS, derived));
+            }
+        }
+
+        /**
+         * 判断某个配置项是否真的在 DDL / SET 里写过。
+         *
+         * <p>不能只看 {@code getOptional(...)}：带默认值的 {@code ConfigOption} 在未配置时
+         * 也会返回默认值，无法区分「用户写了 simple」与「用户没写、取到默认 simple」。
+         * Flink 的 {@link Configuration} 提供了 {@code containsKey}，用它判断最准确；
+         * 其它 {@link ReadableConfig} 实现（例如测试里的自定义实现）退化为「视为未显式配置」。
+         */
+        private static boolean hasExplicit(ReadableConfig c, ConfigOption<?> option) {
+            return c instanceof Configuration && ((Configuration) c).containsKey(option.key());
+        }
+
+        /** 返回第一个非空白值（null 安全）；用于「显式参数优先、properties.* 兜底」的取值链 */
+        private static String firstNonEmpty(String... values) {
+            for (String value : values) {
+                if (value != null && !value.trim().isEmpty()) {
+                    return value.trim();
+                }
+            }
+            return "";
         }
 
         /**

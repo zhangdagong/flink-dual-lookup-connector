@@ -10,10 +10,16 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Time;
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -262,6 +268,99 @@ public class DorisLookupReaderTest {
         }
     }
 
+    /**
+     * 时间主键的反查键必须跨 java.sql / java.time 匹配。
+     *
+     * <p>入参侧（Flink -> Java）是 {@code java.sql.Timestamp}，而 Doris/Connector-J 在部分版本下
+     * 返回 {@code LocalDateTime}。旧实现直接用 {@code toString()} 拼键，
+     * 得到 {@code 2026-09-29 12:30:15.123} 与 {@code 2026-09-29T12:30:15.123}，
+     * 永远对不上——不报错、不降级，只静默返回 NULL。
+     */
+    @Test
+    public void timestampKeysMatchAcrossJavaSqlAndJavaTime() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1));
+
+        // 入参带纳秒，Doris DATETIME(6) 最多到微秒：截断到微秒后应匹配
+        Timestamp input = Timestamp.valueOf("2026-09-29 12:30:15.123456789");
+        backend.pkValue = LocalDateTime.of(2026, 9, 29, 12, 30, 15, 123_456_000);
+
+        Map<Integer, List<Map<String, Object>>> result = reader
+                .batchLookupAsync(Collections.singletonList(new Object[]{input}))
+                .get(3, TimeUnit.SECONDS);
+
+        assertTrue("java.sql.Timestamp 与 LocalDateTime 必须按内容匹配", result.containsKey(0));
+    }
+
+    @Test
+    public void dateKeysMatchAcrossJavaSqlAndJavaTime() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1));
+
+        backend.pkValue = LocalDate.of(2026, 9, 29);
+        Map<Integer, List<Map<String, Object>>> result = reader
+                .batchLookupAsync(Collections.singletonList(new Object[]{Date.valueOf("2026-09-29")}))
+                .get(3, TimeUnit.SECONDS);
+
+        assertTrue("java.sql.Date 与 LocalDate 必须按内容匹配", result.containsKey(0));
+    }
+
+    @Test
+    public void timeKeysMatchAcrossJavaSqlAndJavaTime() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1));
+
+        backend.pkValue = LocalTime.of(9, 0, 0);
+        Map<Integer, List<Map<String, Object>>> result = reader
+                .batchLookupAsync(Collections.singletonList(new Object[]{Time.valueOf("09:00:00")}))
+                .get(3, TimeUnit.SECONDS);
+
+        assertTrue("java.sql.Time 与 LocalTime 必须按内容匹配", result.containsKey(0));
+    }
+
+    /** close 之后线程池/调度器已置空：必须返回异常完成的 Future，而不是同步抛 NPE 让整批悬挂 */
+    @Test
+    public void lookupAfterCloseFailsInsteadOfThrowingNpe() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1));
+        set(reader, "queryExecutor", null);
+        set(reader, "timeoutScheduler", null);
+
+        CompletableFuture<?> f = reader.batchLookupAsync(
+                Collections.singletonList(new Object[]{"A"}));
+        try {
+            f.get(2, TimeUnit.SECONDS);
+            fail("关闭后的查询应以异常完成的 Future 结束");
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof IllegalStateException);
+        }
+    }
+
+    /** 默认 0：不调用 setQueryTimeout，交给 Doris 集群/会话的 query_timeout */
+    @Test
+    public void queryTimeoutZeroLeavesDriverDefault() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1));
+
+        reader.batchLookupAsync(Collections.singletonList(new Object[]{"A"}))
+                .get(3, TimeUnit.SECONDS);
+
+        assertNull("doris.query.timeout=0 时不应调用 setQueryTimeout", backend.queryTimeout.get());
+    }
+
+    /** 显式 queryTimeout 不再被 lookup.timeout 钳制：30s 就是 30s，不会变成 1s */
+    @Test
+    public void explicitQueryTimeoutIsNotClampedByLookupTimeout() throws Exception {
+        FakeBackend backend = new FakeBackend();
+        DorisLookupReader reader = newReader(backend, pool(1), 30);
+
+        reader.batchLookupAsync(Collections.singletonList(new Object[]{"A"}))
+                .get(3, TimeUnit.SECONDS);
+
+        assertEquals("显式 queryTimeout 应原样传给 JDBC，不再受 lookup.timeout=500ms 钳制",
+                Integer.valueOf(30), backend.queryTimeout.get());
+    }
+
     // ---------------- 辅助 ----------------
 
     private ExecutorService pool(int n) {
@@ -271,12 +370,20 @@ public class DorisLookupReaderTest {
     }
 
     private DorisLookupReader newReader(FakeBackend backend, ExecutorService pool) throws Exception {
+        return newReader(backend, pool, null);
+    }
+
+    private DorisLookupReader newReader(FakeBackend backend, ExecutorService pool,
+                                        Integer queryTimeoutSec) throws Exception {
         Configuration c = new Configuration();
         c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
         c.setString(DualLookupOptions.DORIS_TABLE_NAME.key(), "dim.dim_account");
         c.setInteger(DualLookupOptions.LOOKUP_TIMEOUT.key(), 500);
         // 交叉校验要求：hbase.rpc.timeout(默认 300) < lookup.timeout，doris.connect.timeout 同理
         c.setInteger(DualLookupOptions.DORIS_CONNECT_TIMEOUT_MS.key(), 250);
+        if (queryTimeoutSec != null) {
+            c.setInteger(DualLookupOptions.DORIS_QUERY_TIMEOUT_SEC.key(), queryTimeoutSec);
+        }
 
         DorisLookupReader reader = new DorisLookupReader(
                 DualLookupOptions.Config.from(c, "dim_account"),
@@ -309,6 +416,7 @@ public class DorisLookupReaderTest {
 
         final AtomicReference<String> lastSql = new AtomicReference<>();
         final List<Object> boundParams = Collections.synchronizedList(new ArrayList<>());
+        final AtomicReference<Integer> queryTimeout = new AtomicReference<>();
         final AtomicBoolean interruptedOnGetConnection = new AtomicBoolean(false);
         volatile long blockOnGetConnectionMs = 0L;
         /** 结果行第一列（主键列）返回的值；Object 类型以便测试 byte[] / BigDecimal 主键 */
@@ -345,6 +453,9 @@ public class DorisLookupReaderTest {
                         return resultSet();
                     case "setObject":
                         boundParams.add(a[1]);
+                        return null;
+                    case "setQueryTimeout":
+                        queryTimeout.set((Integer) a[0]);
                         return null;
                     default:
                         return null;

@@ -9,6 +9,7 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.sql.SQLException;
+import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -30,10 +31,10 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *
  * <p><b>每行日志同时给出两个视角</b>，用 {@code ||} 分隔：
  * <ul>
- *   <li>前半段 {@code window=Ns}：<b>本阶段</b>增量，读到的就是「刚刚过去这段时间发生了什么」，
+ *   <li>前半段 {@code 本窗口=Ns}：<b>本阶段</b>增量，读到的就是「刚刚过去这段时间发生了什么」，
  *       不必再拿两行日志做减法；</li>
- *   <li>后半段 {@code since-start uptime=Ns}：<b>自启动累计</b>（准确说是本统计实例创建以来，
- *       TaskManager 重启后归零），一眼看到全程总量与长期基线。</li>
+ *   <li>后半段 {@code 自启动=Ns}：<b>自启动累计</b>（准确说是本统计实例创建以来，
+ *       TaskManager 重启后归零），一眼看到全程总量与长期基线；首次窗口与自启动重合时只输出一份。</li>
  * </ul>
  *
  * <p>实现上内部计数<b>始终是单调递增的累计值</b>（因此中途漏看某一行也不会丢数），
@@ -42,10 +43,10 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *
  * <p><b>两个刻意不一致的口径</b>（都容易看错，详见 README 第 10 章）：
  * <ol>
- *   <li>{@code max=} 是<b>区间最大值，不能用「累计相减」换算</b>，因此由写侧用
+ *   <li>{@code 最长=} 是<b>区间最大值，不能用「累计相减」换算</b>，因此由写侧用
  *       {@code getAndSet(0)} 取走（见 {@link #snapshotLine()}）；漏打一行时峰值只会顺延到
  *       下一个窗口，不会像计数那样「合并到下次」，但也不会丢。</li>
- *   <li>{@code hit=} 的分母是<b>该源成功返回的查询所覆盖的 key 数</b>，不是全部批次——
+ *   <li>{@code 命中率=} 的分母是<b>该源成功返回的查询所覆盖的 key 数</b>，不是全部批次——
  *       失败的批次根本没有「命中率」可言，若并入分母，主源一故障命中率就会莫名其妙地掉。</li>
  * </ol>
  *
@@ -71,7 +72,7 @@ public class LookupStats {
     private static final int K_DB = 3;
     private static final int K_OTHER = 4;
     /** 分类标签；与上面的索引一一对应 */
-    static final String[] FAIL_KINDS = {"timeout", "connect", "poolFull", "db", "other"};
+    static final String[] FAIL_KINDS = {"超时", "连接", "池满", "数据库", "其他"};
 
     /** 所属维表名，仅用于日志标识（同一作业可能有多张 dual-lookup 维表） */
     private final String tableName;
@@ -83,16 +84,18 @@ public class LookupStats {
     private final int logIntervalSec;
     /** 配置摘要（只打一次的回执）；为 null 表示不打配置行（单测里常见） */
     private final String configSummary;
+    /** 并行子任务标识，如 {@code 1/4}；为空表示拿不到（本地/测试场景） */
+    private final String subtaskLabel;
     /** 统计实例创建时刻，用于算 since-start 段的 uptime（从而给出「全程平均吞吐」） */
     private final long startMs = System.currentTimeMillis();
 
     // ==================== 累计计数（埋点侧并发写，只增不减） ====================
 
     /**
-     * 提交给主源的 key 总数。
+     * 主源 + 备源实际处理的 key 总数。
      *
-     * <p>注意口径：降级时同一批 key 不会重复计入——备源查询是同一批数据的重试，
-     * 若也算进来，「处理量」会被降级频率虚高。
+     * <p>注意口径：这是「处理量」而不是「业务数据量」。降级时同一批 key 会被主源和备源各处理一次，
+     * 因此会重复计入；这样才能看出后端实际承担了多少工作量。
      */
     private final AtomicLong totalKeys = new AtomicLong();
     /** 降级次数：一次「主源失败 -> 改查备源」记 1 */
@@ -101,7 +104,7 @@ public class LookupStats {
      * 降级波及的 key 数（本阶段/累计）。
      *
      * <p>为什么批次数不够用：33 批 × 50 key 和 33 批 × 1 key 的严重性差 50 倍，
-     * 只看 {@code failover=33} 完全分不出来。有了 key 数才能算出「降级率」，
+     * 只看 {@code 降级=33次} 完全分不出来。有了 key 数才能算出「降级率」，
      * 也才能回答「这次故障到底影响了多少条数据」。
      */
     private final AtomicLong failoverKeys = new AtomicLong();
@@ -127,6 +130,8 @@ public class LookupStats {
     // ---- 备源 ----
     /** 备源执行的批次数（正常情况下应为 0） */
     private final AtomicLong sBatches = new AtomicLong();
+    /** 备源实际处理的 key 数（降级时与主源重复计数） */
+    private final AtomicLong sKeys = new AtomicLong();
     /** 备源失败的批次数（>0 说明两源都异常，需要立即介入） */
     private final AtomicLong sFails = new AtomicLong();
     /** 备源累计查询耗时（纳秒） */
@@ -170,11 +175,20 @@ public class LookupStats {
      */
     public LookupStats(String tableName, String primary, String standby,
                        int logIntervalSec, String configSummary) {
+        this(tableName, primary, standby, logIntervalSec, configSummary, "");
+    }
+
+    /**
+     * @param subtaskLabel 并行子任务标识（如 {@code 1/4}）；为空时日志不显示子任务字段
+     */
+    public LookupStats(String tableName, String primary, String standby,
+                       int logIntervalSec, String configSummary, String subtaskLabel) {
         this.tableName = tableName;
         this.primary = primary;
         this.standby = standby;
         this.logIntervalSec = logIntervalSec;
         this.configSummary = configSummary;
+        this.subtaskLabel = subtaskLabel == null ? "" : subtaskLabel.trim();
     }
 
     /** 启动定时打点；幂等（已启动则不再重复创建线程）；interval<=0 时静默跳过 */
@@ -239,9 +253,16 @@ public class LookupStats {
         updateMax(pMax, nanos);
     }
 
-    /** 备源完成一批查询（含正常降级与主源失败两种情形）；key 数不重复累加 */
-    public void recordStandbyBatch(long nanos) {
+    /**
+     * 备源完成一批查询（含正常降级与主源失败两种情形）。
+     *
+     * <p>key 数会计入总处理量，因此降级时同一批 key 会在主源、备源各计一次；
+     * 这是刻意的「后端工作量」口径，不是业务数据量。
+     */
+    public void recordStandbyBatch(int keys, long nanos) {
         sBatches.incrementAndGet();
+        sKeys.addAndGet(keys);
+        totalKeys.addAndGet(keys);
         sNanos.addAndGet(nanos);
         updateMax(sMax, nanos);
     }
@@ -270,7 +291,7 @@ public class LookupStats {
      *
      * <p>为什么这个指标重要：本连接器的核心语义是「查不到不算异常、不降级」，
      * 于是「维表大面积查不到」这条最危险的故障在日志上<b>完全隐身</b>——
-     * 表被误删、rowkey 编码写错、Doris 同步延迟时，{@code fail=0 failover=0} 一片健康，
+     * 表被误删、rowkey 编码写错、Doris 同步延迟时，{@code 失败=0 降级=0} 一片健康，
      * 作业却默默输出一堆 NULL。命中率是唯一能看出来的指标。
      *
      * @param source    本次结果来自哪个源（主源名或备源名）
@@ -340,8 +361,8 @@ public class LookupStats {
      * <p>包可见而非 private：让单元测试能直接断言日志内容，而不必去捕获日志输出
      * （捕获日志的测试既脆弱又难以覆盖边界）。
      *
-     * @return 形如 {@code [dual-lookup] table=dim_account window=360s ... || table=dim_account since-start uptime=5400s ...}
-     *         的单行文本
+     * @return 形如 {@code [dual-lookup] 表=dim_account | 本窗口=360s ... || 自启动=5400s ...}
+     *         的单行文本；首次窗口与自启动区间重合时只输出一份，避免前后两段完全一样
      */
     String snapshotLine() {
         long now = System.currentTimeMillis();
@@ -364,27 +385,40 @@ public class LookupStats {
         lastSample = raw;
 
         long uptimeSec = uptimeSec();
-        return PREFIX + format("window=" + windowSec + "s", windowSec, stage)
-                + " || " + format("since-start uptime=" + uptimeSec + "s", uptimeSec, total);
+        // 首次打点时「本窗口」和「自启动」覆盖的是同一段，内容完全一样；
+        // 只输出一份，避免用户看到前后两段重复。
+        if (stage.sameAs(total)) {
+            return PREFIX + tablePrefix() + " | "
+                    + format("本窗口=自启动=" + windowSec + "s", windowSec, total);
+        }
+        return PREFIX + tablePrefix() + " | "
+                + format("本窗口=" + windowSec + "s", windowSec, stage)
+                + " || " + format("自启动=" + uptimeSec + "s", uptimeSec, total);
     }
 
     /**
      * 组装一行「自启动以来」的累计快照；仅在 {@link #close()} 收尾时输出。
      *
      * <p>注意副作用：它会把窗口 max 取走并清零（并入历史 max），
-     * 因此调用之后的下一次窗口打点其 {@code max=} 会变短。收尾场景无影响，测试里需留意。
+     * 因此调用之后的下一次窗口打点其 {@code 最长=} 会变短。收尾场景无影响，测试里需留意。
      */
     String totalLine() {
         histPMax = Math.max(histPMax, pMax.getAndSet(0L));
         histSMax = Math.max(histSMax, sMax.getAndSet(0L));
         long uptimeSec = uptimeSec();
-        return PREFIX + format("since-start uptime=" + uptimeSec + "s", uptimeSec,
-                readCounters().withMax(histPMax, histSMax));
+        return PREFIX + tablePrefix() + " | "
+                + format("自启动=" + uptimeSec + "s", uptimeSec,
+                        readCounters().withMax(histPMax, histSMax));
     }
 
     /** 配置回执行（包可见，便于测试断言） */
     String configLine() {
-        return PREFIX + "table=" + tableName + " cfg[" + configSummary + "]";
+        return PREFIX + tablePrefix() + " 配置[" + configSummary + "]";
+    }
+
+    /** 日志行首：表名 + 可选的并行子任务标识（子任务用于区分同表的多条统计行） */
+    private String tablePrefix() {
+        return "表=" + tableName + (subtaskLabel.isEmpty() ? "" : " 子任务=" + subtaskLabel);
     }
 
     /** 自启动至今的秒数（至少 1，避免除零） */
@@ -398,7 +432,7 @@ public class LookupStats {
                 totalKeys.get(), failoverCount.get(), failoverKeys.get(),
                 new Src(pBatches.get(), pKeys.get(), pFails.get(), pNanos.get(),
                         pHitKeys.get(), pHitTotal.get()),
-                new Src(sBatches.get(), 0L, sFails.get(), sNanos.get(),
+                new Src(sBatches.get(), sKeys.get(), sFails.get(), sNanos.get(),
                         sHitKeys.get(), sHitTotal.get()),
                 readFailKinds());
     }
@@ -413,33 +447,37 @@ public class LookupStats {
     }
 
     /**
-     * 把一份计数快照拼成一段文本。
+     * 把一份计数快照拼成一段文本（不含表名，表名由调用方统一放在行首，避免重复）。
      *
-     * <p>平均批大小的分母里有讲究：{@code avgBatch} 刻意只用主源批次数——降级时同一批 key
-     * 会被主源和备源各查一次，若把备源也算进分母，totalKeys 只加一次而批次加了两次，
-     * avgBatch 会被系统性低估，从而把「降级频繁」误读成「攒批没生效」，导致无效调参。
-     * 另给一个 {@code avgBatchWithStandby} 作为对照，两者差距越大说明降级越频繁。
+     * <p>口径说明：
+     * <ul>
+     *   <li>{@code 业务数据量} = 主源处理的 key 数（业务 key，不设备源重复）；</li>
+     *   <li>{@code 总处理key数} = 主源 key 数 + 备源 key 数；降级批次会被两源各计一次；</li>
+     *   <li>{@code 主源平均批大小} 只用主源批次数做分母，避免降级时被备源批次稀释；</li>
+     *   <li>{@code 总体平均批大小} 用总处理 key 数 / 两源总批次数，作为对照。</li>
+     * </ul>
      *
-     * @param head      视角标识（{@code window=360s} / {@code since-start uptime=5400s}）
+     * @param head      视角标识（{@code 本窗口=360s} / {@code 自启动=5400s}）
      * @param windowSec 本视角覆盖的秒数，仅用于算吞吐
      */
     private String format(String head, long windowSec, Sample s) {
         long avgBatch = s.primary.batches == 0L ? 0L : s.primary.keys / s.primary.batches;
         long span = s.primary.batches + s.standby.batches;
-        long avgBatchWithStandby = span == 0L ? 0L : s.totalKeys / span;
+        long overallAvgBatch = span == 0L ? 0L : s.totalKeys / span;
 
-        return String.format(
-                "table=%s %s totalKeys=%d rate=%s avgBatch=%d avgBatchWithStandby=%d | "
-                        + "%s[batches=%d keys=%d fail=%s avg=%s max=%s hit=%s] "
-                        + "%s[batches=%d fail=%d avg=%s max=%s hit=%s] failover=%s",
-                tableName, head, s.totalKeys, rate(s.totalKeys, windowSec), avgBatch, avgBatchWithStandby,
+        return String.format(Locale.ROOT,
+                "%s 业务数据量=%d 总处理key数=%d 速率=%s 主源平均批大小=%d 总体平均批大小=%d | "
+                        + "主源(%s)[批次=%d key数=%d 失败=%s 平均=%s 最长=%s 命中率=%s] "
+                        + "备源(%s)[批次=%d key数=%d 失败=%d 平均=%s 最长=%s 命中率=%s] 降级=%s",
+                head, s.primary.keys, s.totalKeys, rate(s.totalKeys, windowSec), avgBatch, overallAvgBatch,
                 primary, s.primary.batches, s.primary.keys, failText(s.primary.fails, s.failKinds),
                 avgMs(s.primary.nanos, s.primary.batches), singleMs(s.primary.maxNanos, s.primary.batches),
                 pct(s.primary.hitKeys, s.primary.hitTotal),
-                standby, s.standby.batches, s.standby.fails,
+                standby, s.standby.batches, s.standby.keys, s.standby.fails,
                 avgMs(s.standby.nanos, s.standby.batches), singleMs(s.standby.maxNanos, s.standby.batches),
                 pct(s.standby.hitKeys, s.standby.hitTotal),
-                failoverText(s.failover, s.failoverKeys, s.totalKeys));
+                // 降级占比仍以「主源业务 key 数」为分母：totalKeys 现在含备源重复处理，不能拿来做业务占比
+                failoverText(s.failover, s.failoverKeys, s.primary.keys));
     }
 
     /** 平均单批耗时，形如 {@code 12.3ms}；无样本时返回 {@code -} */
@@ -447,7 +485,7 @@ public class LookupStats {
         if (batches <= 0L) {
             return "-";
         }
-        return String.format("%.1fms", totalNanos / NANOS_PER_MS / batches);
+        return String.format(Locale.ROOT, "%.1fms", totalNanos / NANOS_PER_MS / batches);
     }
 
     /** 单个耗时值，形如 {@code 480.0ms}；无样本时返回 {@code -}（0 会被误读成「秒回」） */
@@ -455,7 +493,7 @@ public class LookupStats {
         if (samples <= 0L) {
             return "-";
         }
-        return String.format("%.1fms", nanos / NANOS_PER_MS);
+        return String.format(Locale.ROOT, "%.1fms", nanos / NANOS_PER_MS);
     }
 
     /** 占比文本，形如 {@code 98.7%}；分母为 0 时返回 {@code -} */
@@ -463,7 +501,7 @@ public class LookupStats {
         if (total <= 0L) {
             return "-";
         }
-        return String.format("%.1f%%", 100.0 * part / total);
+        return String.format(Locale.ROOT, "%.1f%%", 100.0 * part / total);
     }
 
     /** 吞吐率，形如 {@code 15.0/s} */
@@ -471,14 +509,14 @@ public class LookupStats {
         if (windowSec <= 0L) {
             return "-";
         }
-        return String.format("%.1f/s", keys / (double) windowSec);
+        return String.format(Locale.ROOT, "%.1f/s", keys / (double) windowSec);
     }
 
     /**
      * 失败数文本：无失败就是朴素的 {@code 0}，有失败才展开非零分类，形如 {@code 2(timeout=1,other=1)}。
      *
      * <p>只列非零项是刻意的：分类桶会随着演进变多，若全量平铺，日志会常年挂着一串 {@code connect=0,db=0}，
-     * 既占宽度又稀释真正的信息。零值不需要出现——{@code fail=} 总数本身就是守恒的。
+     * 既占宽度又稀释真正的信息。零值不需要出现——{@code 失败=} 总数本身就是守恒的。
      */
     private static String failText(long fails, long[] kinds) {
         if (fails <= 0L) {
@@ -496,12 +534,12 @@ public class LookupStats {
         return detail.length() == 0 ? String.valueOf(fails) : fails + "(" + detail + ")";
     }
 
-    /** 降级文本：无降级就是 {@code 0}，有降级则带上波及 key 数与占全部 key 的比例 */
+    /** 降级文本：无降级就是 {@code 0}，有降级则带上波及 key 数与占主源 key 的比例 */
     private static String failoverText(long count, long keys, long totalKeys) {
         if (count <= 0L) {
             return "0";
         }
-        return String.format("%d(%dkeys,%s)", count, keys, pct(keys, totalKeys));
+        return String.format(Locale.ROOT, "%d次(%d个key,%s)", count, keys, pct(keys, totalKeys));
     }
 
     /** 无锁地更新最大值（CAS 失败说明别的线程刚写了更大的值，重试即可） */

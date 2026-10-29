@@ -1,6 +1,7 @@
 package com.roc.flink.connector.dual;
 
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
@@ -27,6 +28,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -95,6 +98,14 @@ public class HBaseLookupReader implements LookupReader {
      * 用 ScheduledThreadPoolExecutor 而非 Executors 工厂方法：后者返回的是包装类，
      * 拿不到队列句柄，无法观测「已完成查询的超时任务是否被及时清理」 */
     private transient ScheduledThreadPoolExecutor timeoutScheduler;
+    /**
+     * 专门执行「断连重连」的线程池。
+     *
+     * <p>不能复用 {@code timeoutScheduler}：重连里的 {@code open()} 是同步阻塞的（ZK/RS 不可用时
+     * 可能几百毫秒到数秒），如果它跑在超时调度器上，会把这期间所有批次的超时任务一起拖住，
+     * 表现为「查询已经超过 lookup.timeout 却成功返回、没有降级」。
+     */
+    private transient ExecutorService reconnectExecutor;
 
     public HBaseLookupReader(DualLookupOptions.Config cfg, String[] columnNames, LogicalType[] columnTypes,
                              LogicalType[] keyTypes) {
@@ -194,6 +205,17 @@ public class HBaseLookupReader implements LookupReader {
                 timeoutScheduler = scheduler;
             }
 
+            // 重连线程池：与超时调度器分开，避免阻塞的 open() 延迟其他批次的超时判定。
+            ExecutorService reconnect = reconnectExecutor;
+            if (reconnect == null || reconnect.isShutdown()) {
+                reconnect = Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "dual-lookup-hbase-reconnect");
+                    t.setDaemon(true);
+                    return t;
+                });
+                reconnectExecutor = reconnect;
+            }
+
             this.connection = conn;
             this.table = asyncTable;
             this.familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
@@ -285,6 +307,18 @@ public class HBaseLookupReader implements LookupReader {
             }
         }
 
+        // hbase.master.keytab.file 是 HMaster 服务端用来登录 hbase/_HOST 的配置，
+        // 客户端（本连接器）不会读它。flink-hbase 的 DDL 里偶尔会带这个参数，
+        // 但它不能替代 hbase.client.keytab.file；这里显式提示，避免用户以为「配了 keytab 却没生效」。
+        String masterKeytab = trimToEmpty(conf.get("hbase.master.keytab.file"));
+        if (keytab.isEmpty() && !masterKeytab.isEmpty()) {
+            LOG.warn("[dual-lookup] 检测到 hbase.master.keytab.file={}，但它是 HBase Master 服务端配置，"
+                    + "客户端不会用它登录。将复用 Flink 全局登录（security.kerberos.login.*）/ kinit 凭据；"
+                    + "如需单表指定客户端凭据，请配置 hbase.client.keytab.file + "
+                    + "hbase.client.kerberos.principal（或对应的 properties.*）",
+                    masterKeytab);
+        }
+
         // ---- 0) krb5.conf ----
         // JVM 级系统属性，必须在第一次 GSS/Kerberos 调用之前生效。
         // 不无脑覆盖：启动脚本若已用 -Djava.security.krb5.conf 指定，就沿用启动参数，
@@ -320,7 +354,11 @@ public class HBaseLookupReader implements LookupReader {
                 throw new IOException("[dual-lookup] 已开启 Kerberos 但未检测到可用凭据。请二选一："
                         + "① 推荐（与 flink-hbase 一致）：在 flink-conf.yaml 配置 "
                         + "security.kerberos.login.keytab / security.kerberos.login.principal；"
-                        + "② 在本表 WITH 里配置 hbase.client.keytab.file / hbase.client.kerberos.principal。"
+                        + "② 在本表 WITH 里配置 hbase.client.keytab.file / hbase.client.kerberos.principal"
+                        + "（或对应的 properties.*）。"
+                        + (masterKeytab.isEmpty()
+                                ? ""
+                                : "注意：hbase.master.keytab.file 是 Master 服务端配置，不能作为客户端凭据；")
                         + "当前 UGI=" + (current == null ? "null" : current.getUserName()));
             }
             LOG.info("[dual-lookup] HBase Kerberos 复用已登录用户（Flink 全局登录或 kinit）: {}",
@@ -471,14 +509,18 @@ public class HBaseLookupReader implements LookupReader {
     }
 
     /**
-     * 释放资源。依次关闭调度器 -> 连接；
-     * 顺序不能反：调度器若在连接关闭后仍触发，会在已销毁的连接上做无意义操作。
+     * 释放资源。依次关闭超时调度器 -> 重连线程池 -> 连接；
+     * 顺序不能反：调度器/重连任务若在连接关闭后仍触发，会在已销毁的连接上做无意义操作。
      */
     @Override
     public synchronized void close() throws Exception {
         if (timeoutScheduler != null) {
             timeoutScheduler.shutdownNow();
             timeoutScheduler = null;
+        }
+        if (reconnectExecutor != null) {
+            reconnectExecutor.shutdownNow();
+            reconnectExecutor = null;
         }
         if (connection != null) {
             connection.close();
@@ -601,8 +643,8 @@ public class HBaseLookupReader implements LookupReader {
      * 异步重建连接后重试一次。
      *
      * <p>不在 HBase 的回调线程里直接 {@code open()}：那会阻塞 Netty 事件循环。
-     * 放到超时调度器的线程上执行，重连耗时不会计入下一批的 {@code lookup.timeout}
-     * （超时计时器是在 {@code batchLookupAsync} 里才启动的）。
+     * 放到**独立的重连线程池**执行，重连耗时不会计入下一批的 {@code lookup.timeout}，
+     * 也不会像以前那样阻塞超时调度器、延迟其他批次的超时判定。
      */
     private void retryAsync(List<Object[]> keys,
                             CompletableFuture<Map<Integer, List<Map<String, Object>>>> result,
@@ -612,13 +654,15 @@ public class HBaseLookupReader implements LookupReader {
             return;
         }
         LOG.warn("[dual-lookup] HBase 连接已断开，重建后重试本批（原因：{}）", cause.toString());
-        ScheduledThreadPoolExecutor scheduler = timeoutScheduler;
-        if (scheduler == null || scheduler.isShutdown()) {
+        // 用独立的重连线程池，绝不复用 timeoutScheduler：open() 是同步阻塞的，
+        // 跑在超时调度器上会拖住同一时刻所有批次的超时任务。
+        ExecutorService reconnect = reconnectExecutor;
+        if (reconnect == null || reconnect.isShutdown()) {
             result.completeExceptionally(cause);
             return;
         }
         try {
-            scheduler.execute(() -> {
+            reconnect.execute(() -> {
                 if (result.isDone()) {
                     return;
                 }
@@ -672,7 +716,15 @@ public class HBaseLookupReader implements LookupReader {
         if (timeoutMs <= 0) {
             return f; // 关闭超时（仅测试用；生产配置强校验必须 > 0）
         }
-        ScheduledFuture<?> timeoutTask = timeoutScheduler.schedule(() -> {
+        // close() 与在途查询存在竞态：调度器可能已被 shutdown 并置空。
+        // 此时不能再 schedule（NPE/RejectedExecutionException），直接让 Future 以「已关闭」结束，
+        // 保证调用方一定能拿到结果，不会悬挂。
+        ScheduledThreadPoolExecutor scheduler = timeoutScheduler;
+        if (scheduler == null || scheduler.isShutdown()) {
+            f.completeExceptionally(new IllegalStateException("[dual-lookup] HBaseLookupReader is closed"));
+            return f;
+        }
+        ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
             if (!f.isDone()) { // 已完成则什么都不做，避免覆盖真实结果
                 f.completeExceptionally(
                         new TimeoutException("HBase lookup timeout after " + timeoutMs + "ms"));
@@ -693,9 +745,12 @@ public class HBaseLookupReader implements LookupReader {
      * 否则表现为「一条也查不到」（空结果不触发降级，全部关联结果为空，很难从日志定位）：
      * <ul>
      *   <li>{@code string}（默认，兼容既有数据）：主键值一律转成字符串再取 UTF-8 字节。
-     *       单主键直接编码；复合主键用 {@code hbase.rowkey.delimiter} 拼接；</li>
+     *       单主键直接编码；复合主键用 {@code hbase.rowkey.delimiter} 拼接。
+     *       注意：DECIMAL 在这里也走 {@code toString()}；如果写入端用的是 HBase 的
+     *       {@code Bytes.toBytes(BigDecimal)} 编码，请改用 {@code typed} 模式（两者对 DECIMAL 等价）；</li>
      *   <li>{@code typed}：按主键的 Flink 类型编码（BIGINT → {@code Bytes.toBytes(long)}、
      *       INTEGER → {@code Bytes.toBytes(int)} 等），与 {@link #decode} 的解码规则严格对称。
+     *       TIMESTAMP 的精度约定与列值一致：precision ≤ 3 用毫秒，&gt; 3 用微秒。
      *       写入端按 HBase 惯例写类型化 rowkey 时必须用这个模式。</li>
      * </ul>
      */
@@ -705,14 +760,19 @@ public class HBaseLookupReader implements LookupReader {
             if (keyValues.length == 1) {
                 return stringBytes(keyValues[0]);
             }
-            StringBuilder sb = new StringBuilder(64);
+            // 复合主键：逐段用 stringBytes 编码后再用分隔符的字节连接。
+            // 不能先拼成字符串再统一转字节：byte[] 段会被 toString() 成对象哈希（[B@...），
+            // 两个内容相同的数组会拼出不同的 rowkey。
+            byte[] delim = Bytes.toBytes(cfg.hbaseRowkeyDelimiter);
+            ByteArrayOutputStream out = new ByteArrayOutputStream(64);
             for (int i = 0; i < keyValues.length; i++) {
                 if (i > 0) {
-                    sb.append(cfg.hbaseRowkeyDelimiter);
+                    out.write(delim, 0, delim.length);
                 }
-                sb.append(keyValues[i] == null ? "" : keyValues[i].toString());
+                byte[] seg = stringBytes(keyValues[i]);
+                out.write(seg, 0, seg.length);
             }
-            return Bytes.toBytes(sb.toString());
+            return out.toByteArray();
         }
 
         // ---- 类型化编码 ----
@@ -735,8 +795,13 @@ public class HBaseLookupReader implements LookupReader {
     }
 
     /**
-     * 字符串编码（{@code rowkey.encoding=string}）：byte[] 直接用；BigDecimal 用 HBase 专用编码
-     * 以保证可比较性；其余一律 {@code toString()} 后取 UTF-8 字节。
+     * 字符串编码（{@code rowkey.encoding=string}）：byte[] 直接用；其余一律 {@code toString()}
+     * 后取 UTF-8 字节。
+     *
+     * <p>这里刻意不对 BigDecimal 做 HBase 专用编码：{@code string} 的契约是「按字符串写 rowkey」，
+     * 而 HBase 的 {@code Bytes.toBytes(BigDecimal)} 是另一种字节格式。此前单主键走 HBase 编码、
+     * 复合主键却走 {@code toString()}，同一种类型在两条路径上编出不同字节，属于隐蔽的不一致。
+     * DECIMAL 主键若要匹配 HBase BigDecimal 编码，请使用 {@code typed} 模式。
      */
     private byte[] stringBytes(Object v) {
         if (v == null) {
@@ -744,9 +809,6 @@ public class HBaseLookupReader implements LookupReader {
         }
         if (v instanceof byte[]) {
             return (byte[]) v;
-        }
-        if (v instanceof BigDecimal) {
-            return Bytes.toBytes((BigDecimal) v);
         }
         return Bytes.toBytes(v.toString());
     }
@@ -759,7 +821,7 @@ public class HBaseLookupReader implements LookupReader {
      * 与 {@code decode} 里统一按 {@code Bytes.toInt} 解码的做法保持一致。
      *
      * <p>DATE/TIME/TIMESTAMP 的值是经 {@code RowDataConverter.toJavaValue} 转换后的
-     * {@code java.sql.Date/Time/Timestamp}，这里反推回 Flink 内部的「天数/毫秒/毫秒」，
+     * {@code java.sql.Date/Time/Timestamp}，这里反推回 Flink 内部的「天数/毫秒/毫秒或微秒」，
      * 与 {@code decode} 的 {@code Bytes.toInt/toLong} 对称。
      */
     private byte[] typedBytes(Object v, LogicalType type) {
@@ -790,8 +852,15 @@ public class HBaseLookupReader implements LookupReader {
                 return Bytes.toBytes(
                         (int) (((java.sql.Time) v).toLocalTime().toNanoOfDay() / 1_000_000L));
             case TIMESTAMP_WITHOUT_TIME_ZONE:
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return Bytes.toBytes(((java.sql.Timestamp) v).getTime());
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
+                // 与 decode()/RowDataConverter 的约定保持一致：
+                // TIMESTAMP(0..3) 存毫秒，TIMESTAMP(4..9) 存微秒。
+                // 只按 getTime()（毫秒）写会和 precision>3 的列值解码路径错开 1000 倍，
+                // 表现为「rowkey 能查到但时间全错」或「时间对但一条也查不到」。
+                long millis = ((java.sql.Timestamp) v).getTime();
+                int precision = (type instanceof TimestampType) ? ((TimestampType) type).getPrecision() : 3;
+                return Bytes.toBytes(precision <= 3 ? millis : millis * 1000L);
+            }
             case BINARY:
             case VARBINARY:
                 return (v instanceof byte[]) ? (byte[]) v : Bytes.toBytes(v.toString());

@@ -7,7 +7,7 @@
 
     <groupId>com.roc</groupId>
     <artifactId>flink-dual-lookup-connector</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.9</version>
     <packaging>jar</packaging>
 
     <name>Flink Dual Lookup Connector (HBase / Doris 双源容错)</name>

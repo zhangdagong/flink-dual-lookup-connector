@@ -7,10 +7,17 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Statement;
+import java.sql.Time;
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -234,6 +241,18 @@ public class DorisLookupReader implements LookupReader {
     public CompletableFuture<Map<Integer, List<Map<String, Object>>>> batchLookupAsync(List<Object[]> keys) {
         CompletableFuture<Map<Integer, List<Map<String, Object>>>> result = new CompletableFuture<>();
 
+        // close() 之后可能仍有迟到的调用（例如主源的降级链、或在途批次），
+        // 此时线程池与调度器已被关闭。先把句柄抓到局部变量，后续只用局部变量：
+        // 否则 close() 在检查之后、submit 之前把字段置空，仍会 NPE 冒泡成「整批悬挂」。
+        ExecutorService executor = queryExecutor;
+        HikariDataSource dataSourceRef = dataSource;
+        ScheduledThreadPoolExecutor scheduler = timeoutScheduler;
+        if (executor == null || dataSourceRef == null || scheduler == null) {
+            result.completeExceptionally(
+                    new IllegalStateException("[dual-lookup] DorisLookupReader is closed"));
+            return result;
+        }
+
         // 过滤空 key（主键为空直接查不到），并建立「主键值 -> 入参下标列表」反查映射
         // 为什么用映射而不是列表下标？因为 SQL 返回的行序与 IN 列表顺序无关（由 Doris 决定），
         // 只能靠主键值反查才能把结果行归到正确的入参下标上。
@@ -271,21 +290,22 @@ public class DorisLookupReader implements LookupReader {
         AtomicReference<Statement> stmtRef = new AtomicReference<>();
         Future<?> task;
         try {
-            task = queryExecutor.submit(() -> {
+            task = executor.submit(() -> {
                 // 上游可能已因超时结束（队列有积压时最常见）：没必要再占一个连接去做没人要的查询
                 if (result.isDone()) {
                     return;
                 }
-                try (Connection conn = dataSource.getConnection();
+                try (Connection conn = dataSourceRef.getConnection();
                      PreparedStatement ps = conn.prepareStatement(sql)) {
                     // 先暴露 Statement 引用，再执行查询：保证超时回调一定拿得到它
                     stmtRef.set(ps);
-                    // JDBC queryTimeout 必须 <= lookup.timeout，否则 Doris 慢查询会在业务层超时降级后
-                    // 仍占用查询线程与连接，直到 JDBC 层才中止，从而把线程池和连接池打满。
-                    // 注意：无论用户配多大，都强制不超过 ceil(lookup.timeout/1000) 秒，这是防打满的硬约束。
-                    int jdbcTimeoutSec = Math.max(1, Math.min(cfg.dorisQueryTimeoutSec,
-                            (int) Math.ceil(cfg.timeoutMs / 1000.0)));
-                    ps.setQueryTimeout(jdbcTimeoutSec);
+                    // 0 = 不设置 JDBC queryTimeout，交给 Doris 集群/会话的 query_timeout；
+                    // >0 = 显式设置，且不再被 lookup.timeout 钳制。
+                    // 业务超时仍由 lookup.timeout 控制：到点 Future 失败并调用 Statement.cancel()，
+                    // 所以 JDBC 层不需要再被强行压到 lookup.timeout 以内。
+                    if (cfg.dorisQueryTimeoutSec > 0) {
+                        ps.setQueryTimeout(cfg.dorisQueryTimeoutSec);
+                    }
                     // 顺序绑定参数：与 buildBatchWhere 生成的 ? 顺序严格一致（外层 key -> 内层列）
                     int idx = 1;
                     for (Object[] k : validKeys) {
@@ -311,16 +331,23 @@ public class DorisLookupReader implements LookupReader {
 
         // 业务层硬超时：与 HBase 实现保持完全一致的语义（未来实现方换掉 HBase，降级逻辑无需改）
         if (cfg.timeoutMs > 0) {
-            ScheduledFuture<?> timeoutTask = timeoutScheduler.schedule(() -> {
-                if (!result.isDone()) {
-                    result.completeExceptionally(
-                            new TimeoutException("Doris lookup timeout after " + cfg.timeoutMs + "ms"));
-                }
-            }, cfg.timeoutMs, TimeUnit.MILLISECONDS);
-            // 查询提前结束时立即取消超时任务：否则它会一直留在调度器队列里直到到期。
-            // 高 QPS + 较大 timeout 时，单线程调度器里会堆积大量「结果早已返回」的任务，
-            // 到期逐个空转扫描，白白占用调度线程与内存
-            result.whenComplete((rows, ex) -> timeoutTask.cancel(false));
+            // close() 与在途查询存在竞态：调度器可能已被 shutdown。
+            // 此时不能再 schedule，直接让 Future 以「已关闭」结束，保证调用方一定能拿到结果。
+            if (scheduler.isShutdown()) {
+                result.completeExceptionally(
+                        new IllegalStateException("[dual-lookup] DorisLookupReader is closed"));
+            } else {
+                ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
+                    if (!result.isDone()) {
+                        result.completeExceptionally(
+                                new TimeoutException("Doris lookup timeout after " + cfg.timeoutMs + "ms"));
+                    }
+                }, cfg.timeoutMs, TimeUnit.MILLISECONDS);
+                // 查询提前结束时立即取消超时任务：否则它会一直留在调度器队列里直到到期。
+                // 高 QPS + 较大 timeout 时，单线程调度器里会堆积大量「结果早已返回」的任务，
+                // 到期逐个空转扫描，白白占用调度线程与内存
+                result.whenComplete((rows, ex) -> timeoutTask.cancel(false));
+            }
         }
 
         // 无论因超时还是异常而失败，都要主动收拾后端：
@@ -458,7 +485,7 @@ public class DorisLookupReader implements LookupReader {
     /**
      * 把单个主键值规范化成「内容相等 ⇔ 字符串相等」的形式。
      *
-     * <p>两类值必须特殊处理，否则对应类型的主键会<b>静默查不到数据</b>（不触发降级、不打异常日志）：
+     * <p>三类值必须特殊处理，否则对应类型的主键会<b>静默查不到数据</b>（不触发降级、不打异常日志）：
      * <ul>
      *   <li><b>byte[]（BINARY/VARBINARY）</b>：{@code toString()} 得到的是对象哈希
      *       （形如 {@code [B@1a2b3c}），两个内容完全相同的数组也会拼出不同字符串，永远查不到。
@@ -466,7 +493,10 @@ public class DorisLookupReader implements LookupReader {
      *   <li><b>BigDecimal（DECIMAL）</b>：{@code toString()} 会带上 scale
      *       （入参 {@code 123}、Doris 返回 {@code 123.00}），二者不匹配。
      *       统一 {@code stripTrailingZeros() + toPlainString()}，
-     *       既消除 scale 差异，也避免科学计数法（{@code 1E+2} vs {@code 100}）。</li>
+     *       既消除 scale 差异，也避免科学计数法（{@code 1E+2} vs {@code 100}）；</li>
+     *   <li><b>时间类型（DATE/TIME/TIMESTAMP）</b>：入参是 {@code java.sql.*}，Doris 可能返回
+     *       {@code java.time.*}；{@code toString()} 的分隔符（空格 vs {@code T}）和小数位都不同。
+     *       统一转成 {@code java.time} 的 ISO 字符串，并截断到微秒。</li>
      * </ul>
      */
     private static String normKeyPart(Object v) {
@@ -479,6 +509,46 @@ public class DorisLookupReader implements LookupReader {
         if (v instanceof BigDecimal) {
             return ((BigDecimal) v).stripTrailingZeros().toPlainString();
         }
+        // 时间类型必须显式归一化，不能依赖 toString()：
+        // 入参侧是 java.sql.Timestamp（toString = "yyyy-MM-dd HH:mm:ss.fffffffff"），
+        // 而 Doris/Connector-J 在某些版本下返回 LocalDateTime（toString = "yyyy-MM-ddTHH:mm:ss"），
+        // 二者永远拼不出同一个键，表现为静默查不到（不报错、不降级）。
+        if (v instanceof Timestamp) {
+            return normDateTime(((Timestamp) v).toLocalDateTime());
+        }
+        if (v instanceof LocalDateTime) {
+            return normDateTime((LocalDateTime) v);
+        }
+        if (v instanceof Date) {
+            return ((Date) v).toLocalDate().toString();
+        }
+        if (v instanceof LocalDate) {
+            return ((LocalDate) v).toString();
+        }
+        if (v instanceof Time) {
+            return normTime(((Time) v).toLocalTime());
+        }
+        if (v instanceof LocalTime) {
+            return normTime((LocalTime) v);
+        }
+        if (v instanceof java.util.Date) {
+            return normDateTime(new Timestamp(((java.util.Date) v).getTime()).toLocalDateTime());
+        }
         return v.toString();
+    }
+
+    /**
+     * 日期时间统一成 ISO 形式，并截断到微秒。
+     *
+     * <p>为什么要截断：Flink 的 TIMESTAMP(9) 可能带纳秒，而 Doris DATETIME 最多到微秒；
+     * 不截断的话，入参的纳秒部分会让键与结果行对不上。微秒是两边的最小公共精度。
+     */
+    private static String normDateTime(LocalDateTime t) {
+        return t.truncatedTo(ChronoUnit.MICROS).toString();
+    }
+
+    /** 时间统一成 ISO 形式并截断到微秒（同 {@link #normDateTime} 的理由） */
+    private static String normTime(LocalTime t) {
+        return t.truncatedTo(ChronoUnit.MICROS).toString();
     }
 }

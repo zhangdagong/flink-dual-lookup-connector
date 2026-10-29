@@ -283,17 +283,18 @@ public class RowDataConverter implements Serializable {
         if (v instanceof LocalDateTime) {
             return Timestamp.valueOf((LocalDateTime) v);
         }
-        if (v instanceof Long) {
-            // Long 的语义取决于 DDL 精度：precision<=3 按毫秒，>3 按微秒（HBase 常见存法）
-            int precision = (type instanceof TimestampType) ? ((TimestampType) type).getPrecision() : 6;
-            if (precision <= 3) {
-                return new Timestamp((Long) v);
-            }
-            long millis = (Long) v / 1000;
-            return new Timestamp(millis);
+        if (v instanceof java.util.Date) {
+            // java.sql.Date / Time / Timestamp 都是 java.util.Date 的子类；
+            // Timestamp 已在上面提前返回，这里兜住其它 Date 形态
+            return new Timestamp(((java.util.Date) v).getTime());
         }
         if (v instanceof Number) {
-            return new Timestamp(((Number) v).longValue());
+            // 数值的时间戳语义取决于 DDL 精度：precision<=3 按毫秒，>3 按微秒（HBase 常见存法）。
+            // 不能只对 Long 做精度判断：HBase 的 Bytes.toLong 会装箱成 Long，但 JDBC/其它源
+            // 可能给 Integer/BigInteger，统一走这里才不会出现「同一种列、不同源解释不同」。
+            long raw = ((Number) v).longValue();
+            int precision = (type instanceof TimestampType) ? ((TimestampType) type).getPrecision() : 3;
+            return precision <= 3 ? new Timestamp(raw) : new Timestamp(raw / 1000L);
         }
         String s = v.toString().trim();
         // 兼容 "yyyy-MM-dd HH:mm:ss" 与 ISO 的 "yyyy-MM-ddTHH:mm:ss" 两种写法。

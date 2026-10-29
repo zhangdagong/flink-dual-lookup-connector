@@ -5,6 +5,9 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.junit.Test;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import static org.junit.Assert.assertEquals;
 
 /**
@@ -105,5 +108,35 @@ public class KerberosConfigTest {
         assertEquals(null, hconf.get("hbase.client.keytab.file"));
         assertEquals(null, hconf.get("hbase.client.keytab.principal"));
         assertEquals(null, hconf.get("hbase.client.kerberos.principal"));
+    }
+
+    /**
+     * 纯 {@code properties.*} 的迁移写法：不写显式 {@code hbase.security.authentication}，
+     * 也必须真正进入 Kerberos 模式，并把 rpc.protection 透传到 HBase Configuration。
+     *
+     * <p>旧实现只读显式参数，默认 simple → {@code applyKerberos()} 直接 return，
+     * 用户表面配了 Kerberos，实际整套认证逻辑被跳过。
+     */
+    @Test
+    public void propertiesOnlyKerberosProducesCorrectBaseConfig() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("hbase.security.authentication", "kerberos");
+        properties.put("hbase.rpc.protection", "privacy");
+        properties.put("hbase.regionserver.kerberos.principal", "hbase/_HOST@HADOOP.COM");
+
+        Configuration c = new Configuration();
+        c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
+        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(c, "dim_account", properties);
+
+        org.apache.hadoop.conf.Configuration hconf = new org.apache.hadoop.conf.Configuration();
+        // 模拟 HBaseLookupReader.open() 里的 properties.* 透传
+        for (Map.Entry<String, String> property : cfg.hbaseProperties.entrySet()) {
+            hconf.set(property.getKey(), property.getValue());
+        }
+        reader(cfg).writeKerberosBaseConfig(hconf);
+
+        assertEquals("kerberos", hconf.get("hbase.security.authentication"));
+        assertEquals("privacy", hconf.get("hbase.rpc.protection"));
+        assertEquals("hbase/_HOST@HADOOP.COM", hconf.get("hbase.regionserver.kerberos.principal"));
     }
 }

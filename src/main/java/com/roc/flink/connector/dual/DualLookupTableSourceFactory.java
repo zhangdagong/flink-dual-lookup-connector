@@ -47,6 +47,10 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         // 与 flink-hbase 保持一致：properties.* 是原样透传给 HBase 客户端配置的，不参与本连接器校验。
         // flink-hbase 的写法就是 helper.validateExcept("properties.")，因此
         // 'properties.hbase.client.keytab.file' 这类参数在两边都可以直接使用。
+        //
+        // ⚠️ 不能改回 helper.validate()：那样 `properties.hbase.security.authentication`、
+        // `properties.hbase.master.kerberos.principal` 等从 flink-hbase 迁过来的参数
+        // 会全部被判为「未知配置」，建表直接失败。
         helper.validateExcept(PROPERTIES_PREFIX);
 
         // 主键强校验：Lookup Join 的本质是「按 key 点查」，没有主键就无法构成点查语义，
@@ -78,7 +82,10 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
             }
         }
 
-        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(config, tableName, hbaseProperties);
+        // 第四个参数是 Session 级配置：table.exec.async-lookup.timeout 不在 WITH 选项里，
+        // 只从 helper.getOptions() 读会永远拿到 Flink 默认的 3 分钟，第 (4) 条交叉校验就形同虚设。
+        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(
+                config, tableName, hbaseProperties, context.getConfiguration());
         return new DualLookupTableSource(cfg, tableName, fieldNames, fieldTypes);
     }
 

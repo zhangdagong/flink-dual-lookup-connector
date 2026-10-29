@@ -9,6 +9,8 @@ import org.apache.flink.table.types.logical.TimestampType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -20,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 双源容错的异步 Lookup Function，带攒批。本类是连接器的<b>主备路由核心</b>。
@@ -53,6 +56,12 @@ public class DualLookupFunction extends AsyncLookupFunction {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(DualLookupFunction.class);
+
+    static {
+        // 进程级兜底：把 Flink PushGateway reporter 的 logger 设为 OFF。
+        // 只影响该 logger，不影响其他 Flink / connector 日志。
+        silencePushGatewayReporter();
+    }
 
     /** 全局配置（含主备源、超时、攒批参数） */
     private final DualLookupOptions.Config cfg;
@@ -104,6 +113,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
     private transient FailoverLogGate failoverGate;
     /** 是否已完成初始化（保证 ensureOpened 幂等） */
     private transient volatile boolean initialized;
+    /** 并行子任务标识（如 1/4），由 open(FunctionContext) 解析；拿不到时为空 */
+    private transient String subtaskLabel = "";
 
     public DualLookupFunction(DualLookupOptions.Config cfg,
                               String tableName,
@@ -126,7 +137,83 @@ public class DualLookupFunction extends AsyncLookupFunction {
      */
     @Override
     public void open(FunctionContext context) throws Exception {
+        // 再调一次：静态块可能在 Log4j2 配置完成之前执行，open 时确保最终生效。
+        silencePushGatewayReporter();
+        subtaskLabel = resolveSubtaskLabel(context);
         ensureOpened();
+    }
+
+    /**
+     * 把 Flink 的 {@code PrometheusPushGatewayReporter} logger 设为 OFF。
+     *
+     * <p>为什么放在连接器里：部分部署环境不允许改 {@code flink-conf.yaml} / {@code log4j2.properties}，
+     * 只能用连接器 jar 作为兜底。
+     *
+     * <p><b>这是进程级副作用</b>：同一个 TM/JVM 上所有作业共享日志级别，不只是当前作业；
+     * 只对 Log4j2 有效，且会把该 reporter 的所有日志一起关掉（包括真实的推送失败）。
+     * 如果集群侧可以改日志配置，应优先在 {@code log4j2.properties} 里处理。
+     *
+     * <p>用反射调用 {@code Configurator.setLevel}，避免连接器编译期依赖 log4j-core。
+     * Logger 不存在、Log4j2 版本不兼容或使用其他日志后端时静默忽略。
+     */
+    private static void silencePushGatewayReporter() {
+        try {
+            Class<?> configurator = Class.forName("org.apache.logging.log4j.core.config.Configurator");
+            Class<?> levelClass = Class.forName("org.apache.logging.log4j.Level");
+            Object off = levelClass.getField("OFF").get(null);
+            configurator.getMethod("setLevel", String.class, levelClass)
+                    .invoke(null,
+                            "org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporter",
+                            off);
+        } catch (Throwable ignored) {
+            // 非 Log4j2、类不存在或版本不兼容：保持 Flink 原日志行为
+        }
+    }
+
+    /**
+     * 解析当前并行子任务编号，用于区分同一张维表的多条统计日志。
+     *
+     * <p>Flink 1.18 的 {@link FunctionContext} 没有公开 {@code getTaskInfo()}，
+     * 但内部持有 {@code RuntimeContext}；新版本则可能已有 {@code getTaskInfo()}。
+     * 这里优先用公开方法，失败再反射内部字段，最后退化为不显示子任务编号。
+     * 反射失败不影响统计主流程。
+     */
+    private static String resolveSubtaskLabel(FunctionContext context) {
+        if (context == null) {
+            return "";
+        }
+        try {
+            Object taskInfo = null;
+            try {
+                Method method = context.getClass().getMethod("getTaskInfo");
+                taskInfo = method.invoke(context);
+            } catch (NoSuchMethodException ignored) {
+                // Flink 1.18：FunctionContext 没有 getTaskInfo()
+            }
+            if (taskInfo == null) {
+                for (Field field : FunctionContext.class.getDeclaredFields()) {
+                    if ("org.apache.flink.api.common.functions.RuntimeContext".equals(field.getType().getName())) {
+                        field.setAccessible(true);
+                        Object runtimeContext = field.get(context);
+                        if (runtimeContext != null) {
+                            Class<?> runtimeContextClass =
+                                    Class.forName("org.apache.flink.api.common.functions.RuntimeContext");
+                            taskInfo = runtimeContextClass.getMethod("getTaskInfo").invoke(runtimeContext);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (taskInfo != null) {
+                Class<?> taskInfoClass = Class.forName("org.apache.flink.api.common.TaskInfo");
+                int index = (Integer) taskInfoClass.getMethod("getIndexOfThisSubtask").invoke(taskInfo);
+                int parallelism = (Integer) taskInfoClass.getMethod("getNumberOfParallelSubtasks").invoke(taskInfo);
+                return (index + 1) + "/" + parallelism;
+            }
+        } catch (Throwable ignored) {
+            // 反射失败只是不显示子任务编号，不影响统计
+        }
+        return "";
     }
 
     /**
@@ -148,7 +235,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
             t.setDaemon(true);
             return t;
         });
-        stats = new LookupStats(tableName, cfg.primary, cfg.standby, cfg.statsLogIntervalSec, configSummary());
+        stats = new LookupStats(tableName, cfg.primary, cfg.standby, cfg.statsLogIntervalSec,
+                configSummary(), subtaskLabel);
         stats.start();
         // 限流间隔从「秒」换算成「毫秒」；<=0 时闸门退化为不限流（visit 恒返回 >=0）
         failoverGate = new FailoverLogGate(cfg.failoverLogIntervalSec * 1000L);
@@ -254,7 +342,13 @@ public class DualLookupFunction extends AsyncLookupFunction {
             batchKeys.clear();
             batchFutures.clear();
         }
-        doBatchLookup(keys, futures);
+        try {
+            doBatchLookup(keys, futures);
+        } catch (Throwable t) {
+            // doBatchLookup 内部已兜底；这里再兜一层，保证 flush() 无论从哪里被调用
+            // （入队线程、定时线程）都不会把异常抛给 Flink 的算子线程。
+            failAll(futures, t);
+        }
     }
 
     /**
@@ -265,43 +359,70 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * 但这个取舍换来了「绝不漏查、绝不静默丢数据」的确定性，对风控类场景更重要。
      */
     private void doBatchLookup(List<Object[]> keys, List<CompletableFuture<Collection<RowData>>> futures) {
-        long startNanos = System.nanoTime(); // 计时起点的唯一来源：含降级时长的总耗时由此算出
+        // 空主键会被 Reader 过滤掉，不应计入吞吐/平均批大小/命中率分母（否则指标会被无效 key 稀释）
+        int queryableKeys = countQueryable(keys);
 
-        call(primary, keys).whenComplete((resultMap, ex) -> {
-            // 主源这一批的耗时（成功、失败都记）：失败批次的耗时同样是主源健康度的关键指标，
-            // 只统计成功批次会把「主源正在变慢、开始不断超时」这段恶化过程完全掩盖掉。
-            // 在完成回调里才计时，才能保证「批次数」与「耗时样本数」严格一一对应
-            stats.recordPrimaryBatch(keys.size(), System.nanoTime() - startNanos);
-            if (ex == null) {
-                // 主源正常返回（包含「查不到」的情况，那是正常业务结果，不算失败）
-                infoRecovered();
-                distribute(futures, resultMap, cfg.primary, startNanos);
-                return;
-            }
-            // ---- 进入降级分支 ----
-            Throwable cause = unwrap(ex);
-            stats.recordPrimaryFail(cause);          // 顺带按异常类型归类（超时/连接/池满/…）
-            stats.recordFailover(keys.size());       // 记 key 数：降级"影响多少条记录"比"降了几批"更有信息量
-            warnFailover(keys.size(), cause);
+        // 最外层 try/catch 是最后一道保险：异步链路里任何一处同步抛错，只要没兜住，
+        // 就会留下「Future 永不完成」的批，表现为 Lookup Join 卡住直到算子级超时。
+        try {
+            long[] primaryStartNanos = new long[1];
+            call(primary, keys, primaryStartNanos).whenComplete((resultMap, ex) -> {
+                try {
+                    // 只统计「查询阶段」耗时：从 Reader 真正发起请求时开始，不含 HBase 惰性建连/预热。
+                    // 失败批次也记，否则主源「正在变慢、开始不断超时」的恶化过程会被掩盖。
+                    long primaryCostNanos = elapsedNanos(primaryStartNanos[0]);
+                    stats.recordPrimaryBatch(queryableKeys, primaryCostNanos);
 
-            // 备源耗时从「真正发起备源查询」的那一刻起算，不含前面等主源超时的那段时间——
-            // 否则主源越慢，备源的「平均耗时」就越难看，指标就失去了诊断价值
-            long standbyStartNanos = System.nanoTime();
-            call(standby, keys).whenComplete((rm2, ex2) -> {
-                stats.recordStandbyBatch(System.nanoTime() - standbyStartNanos);
-                if (ex2 != null) {
-                    // 两源都失败：让整批 Future 异常完成。
-                    // 刻意不「补空结果」，因为静默补空等于把故障伪装成「该 key 不存在」，
-                    // 会产出错误的关联结果；宁可让作业失败暴露问题
-                    stats.recordStandbyFail();
-                    for (CompletableFuture<Collection<RowData>> f : futures) {
-                        f.completeExceptionally(unwrap(ex2));
+                    // 双保险：即使超时调度器被重连/GC 拖延，只要查询阶段已经超过 deadline，
+                    // 也按超时处理并降级。否则会出现「915ms 仍成功、lookup_source=hbase」的假象。
+                    Throwable failure = ex;
+                    if (failure == null && primaryCostNanos > timeoutNanos()) {
+                        failure = new TimeoutException("[dual-lookup] primary lookup took "
+                                + toMillis(primaryCostNanos) + "ms, exceeding lookup.timeout "
+                                + cfg.timeoutMs + "ms");
                     }
-                } else {
-                    distribute(futures, rm2, cfg.standby, startNanos);
+                    if (failure == null) {
+                        // 主源正常返回（包含「查不到」的情况，那是正常业务结果，不算失败）
+                        infoRecovered();
+                        distribute(futures, resultMap, cfg.primary, toMillis(primaryCostNanos),
+                                queryableKeys);
+                        return;
+                    }
+                    // ---- 进入降级分支 ----
+                    Throwable cause = unwrap(failure);
+                    stats.recordPrimaryFail(cause);          // 顺带按异常类型归类（超时/连接/池满/…）
+                    stats.recordFailover(queryableKeys);     // 记 key 数：降级"影响多少条记录"比"降了几批"更有信息量
+                    warnFailover(keys.size(), cause);
+
+                    // 备源耗时同样只从「真正发起备源查询」时起算，不含前面等主源超时的那段时间
+                    long[] standbyStartNanos = new long[1];
+                    call(standby, keys, standbyStartNanos).whenComplete((rm2, ex2) -> {
+                        try {
+                            long standbyCostNanos = elapsedNanos(standbyStartNanos[0]);
+                            stats.recordStandbyBatch(queryableKeys, standbyCostNanos);
+                            if (ex2 != null) {
+                                // 两源都失败：让整批 Future 异常完成。
+                                // 刻意不「补空结果」，因为静默补空等于把故障伪装成「该 key 不存在」，
+                                // 会产出错误的关联结果；宁可让作业失败暴露问题
+                                stats.recordStandbyFail();
+                                failAll(futures, unwrap(ex2));
+                            } else {
+                                // 降级成本 = 主源查询阶段（通常是被超时截断的那段）+ 备源查询阶段
+                                distribute(futures, rm2, cfg.standby,
+                                        toMillis(primaryCostNanos + standbyCostNanos),
+                                        queryableKeys);
+                            }
+                        } catch (Throwable t) {
+                            failAll(futures, t);
+                        }
+                    });
+                } catch (Throwable t) {
+                    failAll(futures, t);
                 }
             });
-        });
+        } catch (Throwable t) {
+            failAll(futures, t);
+        }
     }
 
     /**
@@ -362,35 +483,50 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * （表被误删、rowkey 编码写错、备源同步延迟都会这样）。命中率是唯一能把它照出来的指标，
      * 而这里本来就要逐个 key 判断是否命中，记账是零成本的。
      *
-     * @param source     本次结果来自哪个源；降级后这里会是备源名
-     * @param startNanos 批次开始时间，用于算总耗时（降级场景下含主源超时时间）
+     * @param source        本次结果来自哪个源；降级后这里会是备源名
+     * @param costMs        本次「查询阶段」耗时（不含惰性建连）；降级场景含主源失败 + 备源查询
+     * @param queryableKeys 本批真正会被查询的 key 数（已排除空主键），作为命中率分母
      */
     private void distribute(List<CompletableFuture<Collection<RowData>>> futures,
                             Map<Integer, List<Map<String, Object>>> resultMap,
-                            String source, long startNanos) {
-        long costMs = (System.nanoTime() - startNanos) / 1_000_000L;
+                            String source, long costMs, int queryableKeys) {
+        if (resultMap == null) {
+            // Reader 契约要求返回 Map（可以为空）。返回 null 说明实现有 bug，
+            // 此时宁可整批失败，也不能把它当成「全部查不到」而静默输出 NULL。
+            failAll(futures, new IllegalStateException("[dual-lookup] " + source + " reader 返回了 null 结果"));
+            return;
+        }
         int hits = 0;
         for (int i = 0; i < futures.size(); i++) {
+            CompletableFuture<Collection<RowData>> future = futures.get(i);
             List<Map<String, Object>> rows = resultMap.get(i);
             if (rows == null || rows.isEmpty()) {
                 // 查不到：空结果，不算故障（元字段保持 NULL，由 LEFT JOIN 语义体现）
-                futures.get(i).complete(Collections.emptyList());
+                future.complete(Collections.emptyList());
                 continue;
             }
             // 命中：只要这个 key 有行就算命中（维表一对多时也只算 1 个 key，
             // 否则命中率会随着维表行数放大成无意义的数）
             hits++;
-            // 元信息直接写进行 Map，由 RowDataConverter.resolveValue 读取：
-            // 这样无需改动 Reader 的返回结构，元字段的实现对两个 Reader 完全透明
-            for (Map<String, Object> row : rows) {
-                row.put(RowDataConverter.META_SOURCE_KEY, source);
-                row.put(RowDataConverter.META_COST_KEY, costMs);
+            // 转换必须逐 key 隔离：某一行类型不匹配（DECIMAL 溢出、时间戳格式错误等）
+            // 只应让这一个 key 异常完成，不能中断整个批次、让后面的 Future 永远悬挂。
+            try {
+                // 元信息直接写进行 Map，由 RowDataConverter.resolveValue 读取：
+                // 这样无需改动 Reader 的返回结构，元字段的实现对两个 Reader 完全透明
+                for (Map<String, Object> row : rows) {
+                    row.put(RowDataConverter.META_SOURCE_KEY, source);
+                    row.put(RowDataConverter.META_COST_KEY, costMs);
+                }
+                future.complete(toRows(rows));
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
             }
-            futures.get(i).complete(toRows(rows));
         }
         // 分母用本次查询覆盖的 key 数，而不是全部批次：失败的批次根本没有"命中率"可言，
-        // 若并入分母，主源一故障（查都没查成）命中率就会莫名下跌，指标随之失去意义
-        stats.recordHits(source, hits, futures.size());
+        // 若并入分母，主源一故障（查都没查成）命中率就会莫名下跌，指标随之失去意义。
+        // 这里用 queryableKeys 而不是 futures.size()：空主键根本不会被 Reader 查询，
+        // 算进分母会把命中率无端拉低。
+        stats.recordHits(source, hits, queryableKeys);
     }
 
     /**
@@ -400,7 +536,7 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * 这样调用方（doBatchLookup）无需 try/catch，主源建连失败能自然而然地走降级分支。
      */
     private CompletableFuture<Map<Integer, List<Map<String, Object>>>> call(
-            LookupReader reader, List<Object[]> keys) {
+            LookupReader reader, List<Object[]> keys, long[] queryStartNanos) {
         // close 期间，已提交批次的 whenComplete 降级链仍可能走到这里。
         // 此时绝不能重新 open()：新建出来的连接/线程池将没有人负责关闭，造成资源泄漏
         if (!initialized) {
@@ -418,7 +554,64 @@ public class DualLookupFunction extends AsyncLookupFunction {
                 return f;
             }
         }
-        return reader.batchLookupAsync(keys);
+        // 建连完成之后才开始查询计时：lookup.timeout / lookup_cost_ms 只描述查询阶段，
+        // 不把 HBase 惰性建连、region 预热（首次可能几百毫秒）算进去。
+        queryStartNanos[0] = System.nanoTime();
+        try {
+            return reader.batchLookupAsync(keys);
+        } catch (Throwable t) {
+            // Reader 契约要求返回 Future；若实现同步抛错（关闭竞态、参数校验等），
+            // 必须就地翻译成异常完成的 Future，不能让它冒泡出去——
+            // 冒泡的后果是 flush() 中断、整批 Future 全部悬挂。
+            CompletableFuture<Map<Integer, List<Map<String, Object>>>> f = new CompletableFuture<>();
+            f.completeExceptionally(t);
+            return f;
+        }
+    }
+
+    /**
+     * 该 key 是否会被真正发给后端。两个 Reader 都用「首列为 null」判断无效主键，
+     * 这里保持同一口径，避免统计分母与实际查询量不一致。
+     */
+    private static boolean isQueryable(Object[] key) {
+        return key != null && key.length > 0 && key[0] != null;
+    }
+
+    /** 统计本批中真正会被查询的 key 数（用于吞吐、平均批大小、命中率分母） */
+    private static int countQueryable(List<Object[]> keys) {
+        int count = 0;
+        for (Object[] key : keys) {
+            if (isQueryable(key)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * 让整批 Future 异常完成。
+     *
+     * <p>异步链路的安全底线：每一个返回给 Flink 的 Future 都必须有且只有一次终结。
+     * 已完成（例如 close 时补空）的 Future 再调用 {@code completeExceptionally} 是 no-op，安全。
+     */
+    private static void failAll(List<CompletableFuture<Collection<RowData>>> futures, Throwable cause) {
+        for (CompletableFuture<Collection<RowData>> future : futures) {
+            future.completeExceptionally(cause);
+        }
+    }
+
+    /** 业务层硬超时（纳秒），用于完成回调里的 deadline 兜底 */
+    private long timeoutNanos() {
+        return cfg.timeoutMs * 1_000_000L;
+    }
+
+    /** 从某个起点到现在的纳秒数；起点未设置（建连失败等）时返回 0 */
+    private static long elapsedNanos(long startNanos) {
+        return startNanos <= 0L ? 0L : System.nanoTime() - startNanos;
+    }
+
+    private static long toMillis(long nanos) {
+        return nanos / 1_000_000L;
     }
 
     /**

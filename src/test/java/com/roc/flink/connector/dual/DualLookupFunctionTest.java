@@ -37,16 +37,29 @@ public class DualLookupFunctionTest {
 
     private static DualLookupFunction newFunction(LookupReader primary, LookupReader standby,
                                                   int batchSize, int maxWaitMs) {
+        return newFunction(primary, standby, batchSize, maxWaitMs,
+                new RowDataConverter(new String[]{"pk"}, new LogicalType[]{new VarCharType()}),
+                maxWaitMs + 3000);
+    }
+
+    private static DualLookupFunction newFunction(LookupReader primary, LookupReader standby,
+                                                  int batchSize, int maxWaitMs,
+                                                  RowDataConverter converter) {
+        return newFunction(primary, standby, batchSize, maxWaitMs, converter, maxWaitMs + 3000);
+    }
+
+    private static DualLookupFunction newFunction(LookupReader primary, LookupReader standby,
+                                                  int batchSize, int maxWaitMs,
+                                                  RowDataConverter converter, int timeoutMs) {
         Configuration c = new Configuration();
         c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
         c.setInteger(DualLookupOptions.BATCH_SIZE.key(), batchSize);
         c.setInteger(DualLookupOptions.BATCH_MAX_WAIT.key(), maxWaitMs);
         // 业务超时必须显著大于攒批等待（交叉校验会拒绝 maxWait >= timeout 的组合）
-        c.setInteger(DualLookupOptions.LOOKUP_TIMEOUT.key(), maxWaitMs + 3000);
+        c.setInteger(DualLookupOptions.LOOKUP_TIMEOUT.key(), timeoutMs);
         c.setInteger(DualLookupOptions.STATS_LOG_INTERVAL.key(), 0); // 关掉统计线程，让测试无额外线程
         DualLookupOptions.Config cfg = DualLookupOptions.Config.from(c, "dim_account");
-        return new DualLookupFunction(cfg, "dim_account",
-                new RowDataConverter(new String[]{"pk"}, new LogicalType[]{new VarCharType()}),
+        return new DualLookupFunction(cfg, "dim_account", converter,
                 new LogicalType[]{new VarCharType()},
                 primary, standby);
     }
@@ -324,18 +337,18 @@ public class DualLookupFunctionTest {
         fn.asyncLookup(key("a")).get(3, TimeUnit.SECONDS);
         String line1 = statsOf(fn).snapshotLine();
         assertTrue("主源成功的一批必须留下耗时样本: " + line1,
-                line1.contains("hbase[batches=1 keys=1 fail=0 avg="));
+                line1.contains("主源(hbase)[批次=1 key数=1 失败=0 平均="));
         assertTrue("未降级时备源不应有任何样本: " + line1,
-                line1.contains("doris[batches=0 fail=0 avg=- max=- hit=-]"));
+                line1.contains("备源(doris)[批次=0 key数=0 失败=0 平均=- 最长=- 命中率=-]"));
 
         primary.failWith = new RuntimeException("primary down");
         fn.asyncLookup(key("b")).get(3, TimeUnit.SECONDS); // 主源失败 -> 整批降级
         String line2 = statsOf(fn).snapshotLine();
         assertTrue("失败批次也要计入主源耗时，否则主源恶化过程会被掩盖: " + line2,
-                line2.contains("hbase[batches=1 keys=1 fail=1(other=1) avg="));
+                line2.contains("主源(hbase)[批次=1 key数=1 失败=1(其他=1) 平均="));
         assertTrue("降级后备源必须留下耗时样本: " + line2,
-                line2.contains("doris[batches=1 fail=0 avg="));
-        assertTrue("降级次数应同步: " + line2, line2.contains("failover=1"));
+                line2.contains("备源(doris)[批次=1 key数=1 失败=0 平均="));
+        assertTrue("降级次数应同步: " + line2, line2.contains("降级=1次"));
         fn.close();
     }
 
@@ -362,7 +375,7 @@ public class DualLookupFunctionTest {
         fn.asyncLookup(key("c")).get(3, TimeUnit.SECONDS); // 攒满 3 条触发整批查询
 
         String line = statsOf(fn).snapshotLine();
-        assertTrue("命中率必须来自 distribute 的实际命中数（1/3）: " + line, line.contains("hit=33.3%]"));
+        assertTrue("命中率必须来自 distribute 的实际命中数（1/3）: " + line, line.contains("命中率=33.3%]"));
         fn.close();
     }
 
@@ -378,6 +391,108 @@ public class DualLookupFunctionTest {
         java.lang.reflect.Field f = DualLookupFunction.class.getDeclaredField("stats");
         f.setAccessible(true);
         return (LookupStats) f.get(fn);
+    }
+
+    /**
+     * 单个 key 的类型转换失败不得中断整批。
+     *
+     * <p>回归点：旧实现 {@code distribute} 的循环里直接 {@code future.complete(toRows(rows))}，
+     * 第一行抛异常（DECIMAL 溢出、时间戳格式错误等）就会跳出循环，
+     * 后面的 Future 全部悬挂——表现为 Lookup Join 卡到算子级超时才报错。
+     */
+    @Test
+    public void conversionFailureOnlyFailsThatKey() throws Exception {
+        RecordingReader primary = new RecordingReader();
+        Map<Integer, List<Map<String, Object>>> result = new HashMap<>();
+        result.put(0, Collections.singletonList(newResultRow("bad")));
+        result.put(1, Collections.singletonList(newResultRow("good")));
+        primary.result = result;
+
+        RowDataConverter throwingConverter = new RowDataConverter(
+                new String[]{"pk"}, new LogicalType[]{new VarCharType()}) {
+            @Override
+            public RowData toRowData(Map<String, Object> values) {
+                if ("bad".equals(values.get("pk"))) {
+                    throw new IllegalArgumentException("bad row");
+                }
+                return super.toRowData(values);
+            }
+        };
+        DualLookupFunction fn = newFunction(primary, new RecordingReader(), 2, 1000, throwingConverter);
+
+        CompletableFuture<Collection<RowData>> f1 = fn.asyncLookup(key("bad"));
+        CompletableFuture<Collection<RowData>> f2 = fn.asyncLookup(key("good")); // 攒满 2 条触发
+
+        try {
+            f1.get(3, TimeUnit.SECONDS);
+            fail("转换失败的那个 key 必须异常完成");
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof IllegalArgumentException);
+        }
+        assertEquals("其它 key 不能被连带挂起", 1, f2.get(3, TimeUnit.SECONDS).size());
+        fn.close();
+    }
+
+    /**
+     * Reader 同步抛错（关闭竞态、参数异常等）也必须被翻译成异常完成的 Future。
+     *
+     * <p>旧实现只在 {@code open()} 外面包了 try/catch，{@code batchLookupAsync} 同步抛错会
+     * 冒泡出 {@code flush()}，整批 Future 无人完成。
+     */
+    @Test
+    public void synchronousReaderFailureCompletesAllFutures() throws Exception {
+        LookupReader throwing = new LookupReader() {
+            @Override
+            public void open() {
+            }
+
+            @Override
+            public boolean isOpened() {
+                return true;
+            }
+
+            @Override
+            public CompletableFuture<Map<Integer, List<Map<String, Object>>>> batchLookupAsync(List<Object[]> keys) {
+                throw new IllegalStateException("boom");
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        DualLookupFunction fn = newFunction(throwing, throwing, 2, 1000);
+
+        CompletableFuture<Collection<RowData>> f1 = fn.asyncLookup(key("a"));
+        CompletableFuture<Collection<RowData>> f2 = fn.asyncLookup(key("b"));
+
+        for (CompletableFuture<Collection<RowData>> f : new CompletableFuture[]{f1, f2}) {
+            try {
+                f.get(3, TimeUnit.SECONDS);
+                fail("同步抛错也必须让 Future 异常完成，不能悬挂");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof IllegalStateException);
+            }
+        }
+        fn.close();
+    }
+
+    /**
+     * 回归：主源查询本身超过 lookup.timeout，但超时调度器被重连/GC 拖延，
+     * 查询在 700ms 后「成功」返回。完成回调必须按 deadline 判超时并降级，
+     * 不能出现「耗时 915ms 但 lookup_source=hbase」。
+     */
+    @Test
+    public void latePrimarySuccessStillFailsOver() throws Exception {
+        SlowReader primary = new SlowReader(700);
+        RecordingReader standby = new RecordingReader();
+        DualLookupFunction fn = newFunction(primary, standby, 1, 100,
+                new RowDataConverter(new String[]{"pk"}, new LogicalType[]{new VarCharType()}), 500);
+
+        Collection<RowData> rows = fn.asyncLookup(key("slow")).get(3, TimeUnit.SECONDS);
+
+        assertTrue("备源也无数据时应返回空集合", rows.isEmpty());
+        assertEquals("主源超时后即使成功也必须降级", 1, standby.calls.get());
+        fn.close();
     }
 
     /** 假 Reader：batchLookupAsync 返回一个由测试手动控制的 Future，模拟「查询在途」 */
@@ -402,6 +517,49 @@ public class DualLookupFunctionTest {
         @Override
         public boolean isOpened() {
             return openCalls.get() > 0;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    /** 假 Reader：延迟指定毫秒后「成功」返回空结果，用于模拟超时调度器未及时触发的晚到成功 */
+    static class SlowReader implements LookupReader {
+
+        final long delayMs;
+        final AtomicInteger calls = new AtomicInteger();
+
+        SlowReader(long delayMs) {
+            this.delayMs = delayMs;
+        }
+
+        @Override
+        public CompletableFuture<Map<Integer, List<Map<String, Object>>>> batchLookupAsync(List<Object[]> keys) {
+            calls.incrementAndGet();
+            CompletableFuture<Map<Integer, List<Map<String, Object>>>> future = new CompletableFuture<>();
+            Thread thread = new Thread(() -> {
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    future.completeExceptionally(e);
+                    return;
+                }
+                future.complete(Collections.emptyMap());
+            }, "test-slow-reader");
+            thread.setDaemon(true);
+            thread.start();
+            return future;
+        }
+
+        @Override
+        public void open() {
+        }
+
+        @Override
+        public boolean isOpened() {
+            return true;
         }
 
         @Override
