@@ -1,7 +1,6 @@
 # Flink Dual Lookup Connector
 
-一个 Flink SQL 维表连接器：**HBase 主查、Doris 兜底**，超时/异常自动降级，全程攒批异步。
-SQL 侧照常写 `FOR SYSTEM_TIME AS OF`，容错对业务完全透明。
+一个 Flink SQL 维表连接器：**HBase 主查、Doris 兜底**，超时/异常自动降级，全程攒批异步。SQL 侧照常写 `FOR SYSTEM_TIME AS OF`，容错对业务透明。
 
 ```
 asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBase 批量 Get
@@ -15,13 +14,7 @@ asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBas
 
 ## 1. 解决什么问题
 
-| 单源方案的软肋 | 后果 |
-|---|---|
-| HBase RegionServer / 网络抖动 | 单次点查 5ms → 数秒，算子背压 |
-| HBase 运维重启 | 维表关联整体不可用，作业失败 |
-| Doris 慢查询 | JDBC 阻塞线程、连接池打满，雪崩 |
-
-把「主备路由 + 超时降级 + 攒批」收进一个 connector，DDL 里配好两个源即可，主备对调只改一行。
+单源 HBase 的 RegionServer 抖动、运维重启、网络分区，都会让单次点查从 5ms 涨到数秒，最终算子背压甚至作业失败；单源 Doris 则可能被慢查询打满线程与连接池。本连接器把「主备路由 + 超时降级 + 攒批异步」收进一个 DDL：配好两个源即可，主备对调只改一行 `lookup.primary`。
 
 ## 2. 环境与依赖
 
@@ -32,28 +25,16 @@ asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBas
 | HBase | **2.2.7** | `hbase-shaded-client-**byo-hadoop**`，原生异步客户端 |
 | Hadoop | **3.1.3** | 集群提供；`hadoop-common`/`hadoop-auth` 仅 `provided`，**不打进 jar** |
 | Doris | 4.0.8 | MySQL 协议（JDBC + HikariCP），2.x/3.x 也适用 |
-| Kafka | 3.x（客户端已内置） | **仅告警旁路用**，不参与数据读取；不打进 jar 时也可由集群提供 |
+| Kafka | 3.x（客户端已内置） | **仅告警旁路用**，不参与数据读取 |
 | 构建 | Maven 3.6+ | shade 打 fat jar（约 34MB） |
 
-三条硬约束：
+硬约束：
 
-- **HBase 与 Hadoop 必须成对**。`hbase-shaded-client`（不带 `byo-hadoop`）的 manifest 是 *with Hadoop bundled*，会把整套 Hadoop 打进 jar；曾因此出现
-  `NoSuchMethodError: org.apache.hadoop.fs.FsTracer.get(...)Lorg/apache/htrace/core/Tracer;`（jar 内置 Hadoop 3.4.1，生产 3.1.3，`FsTracer` 返回类型不同）。
-- **htrace 由 Hadoop 提供**：HBase 引用的 `org.apache.htrace.core.Tracer` 必须与 Hadoop 的 `FsTracer` 是同一个类，所以 `htrace-core4` 也不打进 jar。hadoop-free 部署需手动补进 `lib/`。
+- **HBase 与 Hadoop 必须成对**：用 `hbase-shaded-client-byo-hadoop`，带 Hadoop 的版本会引发 `NoSuchMethodError: ... FsTracer.get(...)Lorg/apache/htrace/core/Tracer;`（jar 内置 Hadoop 3.4.1，集群 3.1.3，返回类型不同）。`htrace-core4` 同理不打进 jar，hadoop-free 部署需手动补进 `lib/`。
 - **HikariCP 4.0.3**：兼容 Java 8 的最后一代（5.x 需 Java 11+）。
+- **Kafka 客户端（v1.3+）**：只服务告警旁路（10.1），`lookup.alert.threshold=0`（默认）时不创建任何 Kafka 对象。打包排除了 `zstd-jni`/`lz4-java`/`snappy-java`（省约 8MB），前提是生产者固定 `compression.type=none`——**要开压缩必须同改 pom 与 `KafkaAlertSink`**。集群已有 `flink-connector-kafka` 带来的 kafka-clients 会重复但 child-first 不影响功能，介意可改 `provided`。
 
-关于内置的 Kafka 客户端（v1.3+）：
-
-- 只为「连续降级告警」服务（第 10.1 节）。`lookup.alert.threshold = 0`（默认）时不会创建任何 Kafka 对象。
-- 打包时排除了 `zstd-jni` / `lz4-java` / `snappy-java` 三个压缩库（省约 8MB），前提是生产者固定 `compression.type=none`。**要开压缩必须同时改 pom 与 `KafkaAlertSink`**。
-- 若集群 `lib/` 里已有 `flink-connector-kafka` 带来的 kafka-clients，会出现同名类；Flink 的用户代码类加载器默认 child-first，连接器用的仍是自己这份。介意重复可把 pom 里该依赖改成 `provided`，由集群提供。
-
-```bash
-# 确认集群 Hadoop 世代
-javap -classpath $FLINK_HOME/lib/hadoop-common-*.jar org.apache.hadoop.fs.FsTracer
-# 3.1.3 期望：... org.apache.htrace.core.Tracer get(Configuration)
-# 3.4+ 会是：  ... org.apache.hadoop.tracing.Tracer get(Configuration)  ← 不能混用
-```
+核对集群 Hadoop 世代：`javap -classpath $FLINK_HOME/lib/hadoop-common-*.jar org.apache.hadoop.fs.FsTracer`。3.1.3 返回 `org.apache.htrace.core.Tracer`，3.4+ 是 `org.apache.hadoop.tracing.Tracer`——两者不能混用。
 
 ## 3. 构建与部署
 
@@ -71,8 +52,7 @@ cp target/flink-dual-lookup-connector-1.3.0.jar $FLINK_HOME/lib/
 $FLINK_HOME/bin/stop-cluster.sh && $FLINK_HOME/bin/start-cluster.sh
 ```
 
-> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里，产物约 **34MB**（1.2.x 为 29MB，多出的是 Kafka 客户端；旧版带 Hadoop 时 65MB）。
-> 从 1.1.x 升级时先看第 15 章的「升级要点」。
+> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里。1.3.0 约 **34MB**（1.2.x 为 29MB，多出 Kafka 客户端；更早带 Hadoop 的版本 65MB）。升级前看第 15 章。
 
 ## 4. 最小示例
 
@@ -106,7 +86,7 @@ LEFT JOIN dim_account FOR SYSTEM_TIME AS OF t.proc_time d
     ON t.account_no = d.account_no;
 ```
 
-上线前五条：算子层 `table.exec.async-lookup.timeout` 已设为 `lookup.timeout × 2 + 2s`；hint 的 `'table'` 用 **FROM 里的别名**；维表有 `PRIMARY KEY`；DDL 每个业务列在两源都存在且列名一致；`hbase.table-name` / `hbase.column-family` / `hbase.rowkey.encoding` 与写入端一致。
+上线前核对：算子层 `table.exec.async-lookup.timeout` = `lookup.timeout × 2 + 2s`；hint 的 `'table'` 用 **FROM 里的别名**；维表有 `PRIMARY KEY`；每个业务列在两源都存在且同名；`hbase.table-name` / `hbase.column-family` / `hbase.rowkey.encoding` 与写入端一致。
 
 ## 5. LOOKUP hint
 
@@ -118,22 +98,15 @@ LEFT JOIN dim_account FOR SYSTEM_TIME AS OF t.proc_time d
 | `'async'` | 显式声明异步语义 | 自动异步 |
 | `'capacity'` / `'timeout'` / `'output-mode'` | 只覆盖本条 join 的算子参数，优先级高于全局 SET | 取全局 SET |
 
-- hint 的 `'timeout'` 是**算子层**兜底，与 DDL 的 `lookup.timeout`（**连接器层**降级判据）是两回事，必须大于后者。
-- hint 管不到连接器行为：攒批、主备、rowkey 编码只由 WITH 参数决定。
-- 多表 join 时每张维表各写一条 hint（靠 `'table'` 区分），见 demo.sql。
+hint 的 `'timeout'` 是**算子层**兜底，与 DDL 的 `lookup.timeout`（**连接器层**降级判据）是两回事，必须大于后者；hint 管不到攒批、主备、rowkey 编码。多表 join 时每张维表各写一条（靠 `'table'` 区分）。
 
 ## 6. 运行机制
 
 ### 6.1 攒批：条数 + 时间双触发
 
-| 触发 | 参数 | 默认 |
-|---|---|---|
-| 攒满条数 | `lookup.batch.size` | 50 |
-| 时间兜底 | `lookup.batch.max-wait` | 5ms |
+条数 `lookup.batch.size`（默认 50）或时间 `lookup.batch.max-wait`（默认 5ms），谁先到谁触发。
 
-**有效批大小 ≈ min(batch.size, 每子任务 QPS × max-wait)**，由 `max-wait` 而非 `batch.size` 决定。中等流量下 5ms 只能攒到个位数，攒批近乎失效，建议 30~50ms。
-
-并发上「锁内只入队、锁外做 IO」：批量查询绝不持锁，否则一个慢批次会把所有入队请求堵住。
+**有效批大小 ≈ min(batch.size, 每子任务 QPS × max-wait)**，由 `max-wait` 而非 `batch.size` 决定。中等流量下 5ms 只攒到个位数，攒批近乎失效，建议 30~50ms。并发上「锁内只入队、锁外做 IO」，否则一个慢批次会堵住所有入队请求。
 
 ### 6.2 主备路由与降级
 
@@ -146,33 +119,28 @@ t0       整批查主源 HBase
  t0+1060ms Doris 也没回   → 整批 Future 异常完成，作业失败
 ```
 
-三个刻意的取舍：
-
-- **降级粒度是整批**，主源部分成功也整批重查——换来「绝不漏查、不静默丢数据」的确定性。
-- **HBase 任一个 Get 失败即整批失败**：不完整的结果比走备源更危险。
-- **两源都失败不补空**：静默补空等于把故障伪装成「key 不存在」，宁可让作业失败。
+**降级粒度是整批**（主源部分成功也整批重查，换来「绝不漏查、不静默丢数据」的确定性）；**HBase 任一个 Get 失败即整批失败**（不完整的结果比走备源更危险）；**两源都失败不补空**（静默补空等于把故障伪装成「key 不存在」，宁可让作业失败）。
 
 ### 6.3 超时三层
 
 | 层 | 参数 | 默认 | 职责 |
 |---|---|---|---|
-| 客户端 | `hbase.rpc.timeout` / `hbase.client.operation.timeout` / `doris.query.timeout` | 300 / 500 / 0（跟随 Doris 默认） | 让后端尽早中止、释放资源 |
+| 客户端 | `hbase.rpc.timeout` / `hbase.client.operation.timeout` / `doris.query.timeout` | 300 / 500 / 0（跟随 Doris） | 让后端尽早中止、释放资源 |
 | 业务 | `lookup.timeout` | 500 | **唯一的降级判据** |
 | 算子 | `table.exec.async-lookup.timeout` | Flink 3min，建议 10s | 最终兜底，防 Future 永不完成 |
 
-建连阶段会预热 region location，避免冷启动定位耗时撞上 500ms 超时被误判降级。交叉校验与自动推导见第 7 章。
+建连阶段会预热 region location，避免冷启动定位耗时撞上 500ms 超时被误判降级。交叉校验与推导见第 7 章。
 
 ### 6.4 五条边界
 
-- **查不到 ≠ 故障**：空结果不降级。否则合法缺失会让每批都查两遍，备源压力翻倍。
-- **Future 一定有终结**：类型转换失败、Reader 同步抛错、Reader 返回 null 结果，都会让对应 Future 异常完成；绝不留「永不完成」的批。
-- **惰性建连**：Reader 构造时不建连，首次查询才 `open()`。主源启动时不可用也能起作业、直接走备源。Doris 侧连池也是惰性的（`initializationFailTimeout=-1`），避免 HikariCP 建池失败固定睡 1 秒。
-- **连接自愈**：HBase 备源空闲时连接会被服务端回收。`isOpened()` 检查 `AsyncConnection.isClosed()`，断开自动重建；查询中撞上 `ConnectionClosedException` 会替换失败连接并重试一次。
-- **防打满**：超时回调调 `Statement.cancel()` 真中止 SQL；`doris.query.timeout=0`（默认）不设置 JDBC queryTimeout，业务超时仍由 `lookup.timeout` 独立控制；查询线程数 = `doris.pool.size`，队列有界，过载快速拒绝并降级。
+- **查不到 ≠ 故障**：空结果不降级，否则合法缺失会让每批都查两遍、备源压力翻倍。
+- **Future 一定有终结**：类型转换失败、Reader 同步抛错、Reader 返回 null，都会让对应 Future 异常完成，绝不留「永不完成」的批。
+- **惰性建连 + 自愈**：Reader 构造时不建连，首次查询才 `open()`，因此主源启动时不可用也能起作业、直接走备源（Doris 连池同理，`initializationFailTimeout=-1`，避免建池失败固定睡 1 秒）；HBase 连接被服务端回收后，`isOpened()` 检查 `AsyncConnection.isClosed()` 自动重建，撞 `ConnectionClosedException` 会换连接重试一次。
+- **防打满**：超时回调 `Statement.cancel()` 真中止 SQL；`doris.query.timeout=0` 不设 JDBC queryTimeout；查询线程数 = `doris.pool.size`，队列有界，过载快速拒绝并降级。
 
 ## 7. 参数
 
-时间类参数统一「毫秒整数」；`doris.query.timeout` 例外（秒，跟随 JDBC）。
+时间类统一「毫秒整数」；`doris.query.timeout` 例外（秒，跟随 JDBC）。
 
 ### 7.1 核心
 
@@ -196,9 +164,9 @@ doris.pool.min-idle        ≤  doris.pool.size
 doris.pool.validation-timeout  ≤  doris.connect.timeout
 ```
 
-`table.exec.async-lookup.timeout` 是 **Session 级**配置（`SET`），不是 WITH 参数；`SET` 必须写在 `CREATE TABLE` 之前。
+`table.exec.async-lookup.timeout` 是 **Session 级**配置（`SET`），不是 WITH 参数，且必须写在 `CREATE TABLE` 之前。
 
-**`lookup.timeout` 联动推导**：仅在显式设置 `lookup.timeout`、且下列参数未显式设置时生效；显式参数优先。
+**`lookup.timeout` 联动推导**：仅在显式设置 `lookup.timeout`、且下列参数未显式设置时生效，显式参数优先。
 
 | 依赖项 | 自动推导 | 理由 |
 |---|---|---|
@@ -206,29 +174,25 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `hbase.client.operation.timeout` | `max(500, lookup.timeout)` | 避免 HBase 客户端先于业务超时放弃 |
 | `doris.connect.timeout` | `80% × lookup.timeout`，夹到 `[250, 300]ms` | 250 是 HikariCP 下限，300 防止最后一跳吃满预算 |
 
-`lookup.timeout ≤ 250ms` 且未显式配 `doris.connect.timeout` 时，下限与 `< lookup.timeout` 无法同时满足，建表期会直接报错。
+`lookup.timeout ≤ 250ms` 且未显式配 `doris.connect.timeout` 时，下限与 `< lookup.timeout` 无法同时满足，建表期直接报错。
 
 ### 7.2 HBase
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `hbase.zookeeper.quorum` | — | 留空则用 classpath 下 `hbase-site.xml` |
-| `hbase.zookeeper.property.clientPort` | `2181` | |
-| `zookeeper.znode.parent` | `/hbase` | |
+| `hbase.zookeeper.property.clientPort` / `zookeeper.znode.parent` | `2181` / `/hbase` | |
 | `hbase.table-name` | DDL 表名 | 支持 `命名空间:表名` |
-| `hbase.column-family` | `info` | 只支持单列族，所有业务列按同名列读取 |
+| `hbase.column-family` | `info` | 只支持单列族，业务列按同名列读取 |
 | `hbase.rowkey.delimiter` | `\|` | 复合主键拼接分隔符 |
 | `hbase.rowkey.encoding` | `string` | `string` / `typed`，**必须与写入端一致** |
-| `hbase.rpc.timeout` | `300` | 必须 < `lookup.timeout`；未显式配置时按 80% 推导 |
-| `hbase.client.operation.timeout` | `500` | 含冷启动定位，建议 2000；未显式配置时取 `max(500, lookup.timeout)` |
+| `hbase.rpc.timeout` | `300` | 必须 < `lookup.timeout`；未显式配置按 80% 推导 |
+| `hbase.client.operation.timeout` | `500` | 含冷启动定位，建议 2000；未显式配置取 `max(500, lookup.timeout)` |
 | `hbase.client.retries.number` | `1` | 实时链路 0~1 |
 
 ⚠️ **rowkey 编码选错是最难查的故障**：一条也查不到，但不报错、不降级，最终整表关联结果全为 NULL。建连日志会打印 `rowkeyEncoding=`，先核对它。
 
-- `string` 模式下 DECIMAL 走 `toString()`；若写入端用 HBase `Bytes.toBytes(BigDecimal)`，请改用 `typed`。
-- `string` 复合主键：逐段编码后用分隔符字节连接；`byte[]` 段直接用原始字节。
-- 列值解码：`BOOLEAN`→1 字节；`TINYINT/SMALLINT/INTEGER`→4 字节 int；`BIGINT`/`DOUBLE`→8 字节；`FLOAT`→4 字节；`DECIMAL`→HBase BigDecimal 编码；`DATE/TIME`→4 字节 int；`TIMESTAMP`→8 字节 long；`CHAR/VARCHAR`→UTF-8；`BINARY`→原始字节。
-- `TIMESTAMP(p ≤ 3)` 的 long 是**毫秒**，`p > 3` 是**微秒**；`typed` rowkey 与列值使用同一约定。
+- `string` 模式 DECIMAL 走 `toString()`；写入端若用 `Bytes.toBytes(BigDecimal)` 请改 `typed`。复合主键逐段编码后用分隔符字节拼接，`byte[]` 段用原始字节。列值按 HBase 原生编码解码（BOOLEAN 1 字节，TINYINT/SMALLINT/INTEGER/FLOAT/DATE/TIME 4 字节，BIGINT/DOUBLE 8 字节，CHAR/VARCHAR UTF-8，DECIMAL 用 BigDecimal 编码，BINARY 原始字节）；`TIMESTAMP(p≤3)` 的 long 是**毫秒**、`p>3` 是**微秒**，rowkey 与列值同约定。
 
 ### 7.3 HBase Kerberos
 
@@ -238,12 +202,11 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `hbase.client.keytab.file` | — | **可选**；不配则复用 Flink 全局登录 / kinit |
 | `hbase.client.kerberos.principal` | — | **可选**，与 keytab 成对；不能含 `_HOST` |
 | `hbase.rpc.protection` | `authentication` | `authentication` / `integrity` / `privacy`，须与服务端一致 |
-| `hbase.regionserver.kerberos.principal` | — | 如 `hbase/_HOST@REALM` |
-| `hbase.master.kerberos.principal` | — | 同上 |
+| `hbase.regionserver.kerberos.principal` / `hbase.master.kerberos.principal` | — | 如 `hbase/_HOST@REALM` |
 | `hbase.kerberos.krb5.conf` | — | JVM 已用 `-Djava.security.krb5.conf` 指定则不覆盖 |
 | `properties.*` | — | 原样透传给 HBase `Configuration`（兼容 flink-hbase）；`properties.hbase.security.authentication` 等也参与 Kerberos 决策 |
 
-> `properties.hbase.master.keytab.file` 是 HMaster **服务端**配置，客户端不会用它登录：只透传 + WARN。客户端凭据是 `hbase.client.keytab.file + principal`，或直接复用 Flink 全局登录。
+> `properties.hbase.master.keytab.file` 是 HMaster **服务端**配置，客户端不会用它登录：只透传 + WARN。客户端凭据是 `hbase.client.keytab.file + principal`，或复用 Flink 全局登录。
 
 ### 7.4 Doris 与连接池
 
@@ -253,12 +216,11 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `doris.table-name` | DDL 表名 | 支持 `库.表` |
 | `doris.username` / `doris.password` | `root` / 空 | |
 | `doris.driver` | `com.mysql.cj.jdbc.Driver` | 留空按 URL 推断 |
-| `doris.query.timeout` | `0` | 秒；`0` = 不设 JDBC queryTimeout，跟随 Doris 默认；`>0` 时**不受 `lookup.timeout` 钳制** |
+| `doris.query.timeout` | `0` | 秒；`0` = 不设 JDBC queryTimeout；`>0` 时**不受 `lookup.timeout` 钳制** |
 | `doris.pool.size` | `4` | 最大连接数 = 查询线程数；Doris 作主源时调到 8~16 |
 | `doris.pool.min-idle` | `2` | 必须 ≤ `pool.size` |
-| `doris.connect.timeout` | `300` | 必须 < `lookup.timeout`；未显式配置时按 80% 推导并夹到 `[250,300]ms` |
-| `doris.pool.idle-timeout` | `600000` | |
-| `doris.pool.max-lifetime` | `1800000` | 须 > idle-timeout |
+| `doris.connect.timeout` | `300` | 必须 < `lookup.timeout`；未显式配置按 80% 推导并夹到 `[250,300]ms` |
+| `doris.pool.idle-timeout` / `doris.pool.max-lifetime` | `600000` / `1800000` | 后者须 > 前者 |
 | `doris.pool.validation-timeout` | `250` | 必须 ≤ `connect.timeout` |
 
 > `doris.query.timeout` 只管 JDBC/服务端查询能跑多久，业务降级仍由 `lookup.timeout` 控制：到点 Future 失败并 `Statement.cancel()` 中止 SQL。
@@ -271,62 +233,39 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `lookup.alert.kafka.bootstrap-servers` | — | 阈值 > 0 时**必填** |
 | `lookup.alert.kafka.topic` | — | 阈值 > 0 时**必填** |
 | `lookup.alert.kafka.message` | 内置 JSON | 消息模板，占位符见 10.1；建表期校验 |
-| `lookup.alert.kafka.acks` | `1` | `0` / `1` / `all`；生产者已关幂等，不会与 acks 冲突 |
+| `lookup.alert.kafka.acks` | `1` | `0` / `1` / `all`；生产者已关幂等，不与 acks 冲突 |
 
-语义、示例消息与注意事项见 **10.1**。三条建表期校验：阈值为负直接报错；启用但缺 bootstrap/topic 报错；模板不是 JSON 或含未知占位符报错。
+语义与注意事项见 **10.1**。三条建表期校验：阈值为负报错；启用但缺 bootstrap/topic 报错；模板非 JSON 或含未知占位符报错。
 
 ## 8. 内置元字段
 
-在维表 DDL 里声明这两个约定名，即可拿到每次 Lookup 的元信息；它们不查后端，TableSource 会自动从查询列中剥离。
+在维表 DDL 里声明这两个约定名即可拿到每次 Lookup 的元信息；它们不查后端，TableSource 会自动从查询列中剥离。
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `lookup_source` | `STRING` | 数据来源 `hbase` / `doris` |
 | `lookup_cost_ms` | `BIGINT` | 查询阶段耗时（毫秒，**不含惰性建连**；降级时含两段查询） |
 
-同一批内所有命中行拿到相同的 `lookup_cost_ms`；主源空结果时两者为 `NULL`（miss 没有维表行可承载元字段）。
+同一批内所有命中行 `lookup_cost_ms` 相同；主源空结果时两者为 `NULL`（miss 没有维表行可承载元字段）。
 
 ## 9. Kerberos 实践
 
-**推荐：keytab 交给 Flink 全局配置，连接器不写 keytab。** Flink 的 `HadoopModule` 在 TM 启动时用
-`security.kerberos.login.keytab` / `principal` 完成登录（并按 `security.kerberos.relogin.period` 自动续期），
-flink-hbase 与本连接器都直接复用这个 UGI。
-
-```yaml
-# flink-conf.yaml —— keytab 必须存在于每个 TM 的这个路径
-security.kerberos.login.keytab: /home/flink/streampark/kerberos/trdw.keytab
-security.kerberos.login.principal: ro@EXAMPLE.COM
-```
+**推荐：keytab 交给 Flink 全局配置，连接器不写 keytab。** 在 `flink-conf.yaml` 配 `security.kerberos.login.keytab` / `security.kerberos.login.principal`（keytab 须存在于每个 TM 的该路径），`HadoopModule` 在 TM 启动时完成登录并按 `security.kerberos.relogin.period` 自动续期；flink-hbase 与本连接器都复用这个 UGI。
 
 ```sql
--- 维表只打开认证方式与保护级别
+-- 维表侧只打开认证方式与保护级别
 'hbase.security.authentication'         = 'kerberos',
 'hbase.rpc.protection'                  = 'authentication',
 'hbase.regionserver.kerberos.principal' = 'hbase/_HOST@EXAMPLE.COM'
 ```
 
-需要**单表覆盖**全局登录用户时，或沿用 flink-hbase 写法时：
+单表覆盖全局用户：`hbase.client.kerberos.principal` + `hbase.client.keytab.file`；沿用 flink-hbase 写法：`properties.hbase.client.keytab.file` / `properties.hbase.client.kerberos.principal`。
 
-```sql
--- A. 本连接器显式参数
-'hbase.client.kerberos.principal' = 'ro@EXAMPLE.COM',
-'hbase.client.keytab.file'        = '/path/to/ro.keytab',
+**凭据顺序**：① 未配 keytab → 用当前 UGI，完全无凭据则报错并提示两种配法；② keytab 配了且当前用户就是这个 principal → 复用，不重复登录；③ keytab 不可读但 UGI 已有凭据 → **降级复用 + WARN**（keytab 只需在真正读它的节点可读）；④ 都没有 → 报错。
 
--- B. flink-hbase 迁移写法（properties.* 原样透传）
-'properties.hbase.client.keytab.file'        = '/path/to/ro.keytab',
-'properties.hbase.client.kerberos.principal' = 'ro@EXAMPLE.COM'
-```
+**从 flink-hbase 迁移**：参数加 `hbase.` 前缀（`table-name`→`hbase.table-name`、`zookeeper.quorum`→`hbase.zookeeper.quorum`），补 `hbase.column-family` / `hbase.rowkey.encoding` / `doris.jdbc-url` / `PRIMARY KEY`，`properties.*` 原样保留。
 
-**凭据选择顺序**：
-
-1. 未配 keytab → 用当前 UGI（Flink 全局登录 / kinit）；完全没有凭据时报错并提示两种配置方式；
-2. 配了 keytab 且当前用户就是该 principal → 复用，不重复登录；
-3. 配了 keytab 但文件不可读、而当前 UGI 已有凭据 → **降级复用 + WARN**（keytab 只需在真正读它的节点可读）；
-4. 无凭据且 keytab 读不到 → 报错。
-
-**从 flink-hbase 迁移**：参数名加 `hbase.` 前缀（`table-name`→`hbase.table-name`、`zookeeper.quorum`→`hbase.zookeeper.quorum`），补 `hbase.column-family` / `hbase.rowkey.encoding` / `doris.jdbc-url` / `PRIMARY KEY`；`properties.*` 可原样保留。
-
-**核验**：日志出现 `HBase Kerberos 复用已登录用户（Flink 全局登录或 kinit）: ro@EXAMPLE.COM`（或显式模式下的 `HBase Kerberos 就绪: ... loginUser=...`）→ `klist -kt <keytab>` 确有该 principal → TM 与 KDC 时间差 < 5 分钟 → principal 有表的 `RW` 权限。
+**核验**：日志出现 `HBase Kerberos 复用已登录用户（Flink 全局登录或 kinit）: ro@EXAMPLE.COM`（显式模式为 `HBase Kerberos 就绪: ... loginUser=...`）→ `klist -kt <keytab>` 有该 principal → TM 与 KDC 时间差 < 5 分钟 → principal 有表 `RW` 权限。
 
 ## 10. 可观测性
 
@@ -340,36 +279,31 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 |---|---|---|
 | `子任务=i/N` | 并行子任务编号；并行度 >1 时每个子任务各一行 | 同表多行属正常 |
 | `本窗口=` / `自启动=` | 本阶段 / 自启动累计（TM 重启归零） | 判断「现在好不好」只看前者 |
-| `业务数据量` | 主源处理的 key 数（不设备源重复） | 与上游 QPS 对比 |
-| `总处理key数` | 主源 + 备源实际处理 key 数 | 与业务数据量的差值 = 备源重复量 |
+| `业务数据量` / `总处理key数` | 主源 key 数 / 主源+备源实际处理 key 数 | 两者差值 = 备源重复量 |
 | `速率` / 平均批大小 | 吞吐与攒批效果 | `主源平均批大小` 长期接近 1 → 攒批没生效 |
-| `主源(...)` / `备源(...)` | 批次数、key 数、失败数、平均/最长耗时、命中率 | 备源 `批次>0` 说明在降级；备源 `失败>0` 说明两源同时异常 |
+| `主源(...)` / `备源(...)` | 批次数、key 数、失败数、平均/最长耗时、命中率 | 备源 `批次>0` 在降级；备源 `失败>0` 两源同时异常 |
 | `失败=` | 分类：`超时` / `连接` / `池满` / `数据库` / `其他`，只列非零项 | 分类决定处置动作 |
 | `降级=N次(K个key,P%)` | 降级次数 + 波及 key 数与占主源 key 比例 | 占比持续上升 → 主源不可用 |
 
-五个读法：① 判断当前是否变差只看 `本窗口=`；② **`命中率=` 是唯一能照出「维表大面积查不到」的指标**（表误删、编码写错时 `失败=0 降级=0` 一片健康）；③ `平均` 与 `最长` 一起看，长尾才是隐患；④ `最长` 逐窗口清零，漏打一行会顺延；⑤ 无样本显示 `-` 而不是 `0`。
+读法：① 判断当前是否变差只看 `本窗口=`；② **`命中率=` 是唯一能照出「维表大面积查不到」的指标**（表误删、编码写错时 `失败=0 降级=0` 一片健康）；③ `平均` 与 `最长` 一起看，长尾才是隐患；④ `最长` 逐窗口清零，漏打一行会顺延；⑤ 无样本显示 `-` 而不是 `0`。
 
 降级 WARN 默认按 `lookup.failover.log-interval` 限流（首条必打 + 采样 + 合并计数 + 恢复补打）。不限流时，5000 条/分钟、30ms 攒批下约 **285 万行/天**，会把故障起点的上下文冲掉。
 
-> **PushGateway 日志静音（v1.2.4）**：`DualLookupFunction` 初始化与 `open()` 时会把
-> `org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporter` 的 logger 设为 `OFF`。
-> 这是 **JVM 级副作用**（同 TM 所有作业共享），只对 Log4j2 有效，且会隐藏该 reporter 的全部日志（含真实推送失败）。
-> 集群侧能改 `log4j2.properties` 时，应优先在集群侧处理；否则可删掉连接器里的静音代码。
+> **PushGateway 日志静音（v1.2.4）**：`DualLookupFunction` 初始化与 `open()` 时把 `org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporter` 的 logger 设为 `OFF`。这是 **JVM 级副作用**，只对 Log4j2 有效，且会隐藏该 reporter 的全部日志（含真实推送失败）；集群侧能改 `log4j2.properties` 时优先集群侧处理。
 
 ### 10.1 连续降级告警（推 Kafka）
 
-日志要人去翻，告警要系统自己喊。`lookup.alert.threshold = n` 开启后：**主源任意一批成功即清零**，连续 n 批都降级到备源时，向 Kafka 推一条自定义 JSON。
+日志要人去翻，告警要系统自己喊。`lookup.alert.threshold = n` 开启后：**主源任意一批成功即清零**，连续 n 批都降级到备源时向 Kafka 推一条自定义 JSON。
 
 ```sql
 'lookup.alert.threshold'               = '10',
 'lookup.alert.kafka.bootstrap-servers' = 'localhost:9092',
 'lookup.alert.kafka.topic'             = 'dual_lookup_alert',
-
--- 可选：不写就用内置模板。在 SQL 里用单引号包整个模板，内部一律双引号
+-- 可选，不写就用内置模板；SQL 里用单引号包整个模板，内部一律双引号
 'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},"keys":${affectedKeys},"reason":"${reason}"}'
 ```
 
-默认模板渲染出来是这样（连续 10 批降级、波及 500 个 key）：
+默认模板渲染（连续 10 批降级、波及 500 个 key）：
 
 ```json
 {"alert":"dual-lookup-failover","table":"dim_account","primary":"hbase","standby":"doris","threshold":10,"consecutive":10,"affectedKeys":500,"reason":"TimeoutException: HBase lookup timeout after 500ms","subtask":"1/4","timestamp":1794141799631,"datetime":"2026-11-08T20:43:19.631+08:00"}
@@ -377,33 +311,26 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 
 | 占位符 | 含义 |
 |---|---|
-| `${table}` | 维表名 |
-| `${primary}` / `${standby}` | 主源 / 备源（`hbase` / `doris`） |
+| `${table}` / `${primary}` / `${standby}` | 维表名 / 主源 / 备源（`hbase`/`doris`） |
 | `${threshold}` / `${consecutive}` | 配置阈值 / 触发时的连续批数 |
 | `${affectedKeys}` | 这几批一共波及多少 key（回答「影响多少条数据」） |
-| `${reason}` | 最近一次失败原因，`异常类名: message` |
-| `${subtask}` | 并行子任务号，如 `1/4`；无并行度信息时为空串 |
+| `${reason}` / `${subtask}` | 最近一次失败原因 `异常类名: message` / 子任务号如 `1/4` |
 | `${timestamp}` / `${datetime}` | epoch 毫秒 / 带时区 ISO-8601 |
 
-**五条容易踩的**：
+**四条容易踩的**：
 
-1. **边沿触发，一次故障只推一条**。计数「恰好等于」阈值那一批推，之后继续降级不再重复推——否则持续故障会每 n 批推一条，把 Kafka 变成另一个日志洪峰。故障是否仍在持续，看统计日志的 `降级=` 与限流 WARN。重新武装的唯一条件是**主源成功一批**。
-2. **并行度会放大条数**。计数是**每个子任务独立**的，并行度 4 时同一次故障最多收到 4 条（各自在第 n 批触发）。消息里带 `subtask`，下游按「表 + 时间窗」去重即可。
-3. **n 可以换算成「容忍主源抖动多久」**：`n × 单批耗时 ≈ 容忍时长`。默认 `lookup.timeout=500ms` 下，10 批 ≈ 5 秒、60 批 ≈ 30 秒。夜间告警调大、核心链路调小。
-4. **旁路保障**：投递在独立守护线程 + 有界队列里做，`send()` 本身只入队——因为 `KafkaProducer.send()` 在元数据不可用时最长可阻塞 60 秒，直接在降级回调里调用会把维表查询拖死。Kafka 不可达、队列打满（丢一条 WARN）、生产者创建失败，都只影响告警，**不影响任何一次查询**。
-5. **模板规则**：占位符替换成**已做 JSON 转义的内容（不含引号）**，所以字符串字段自己加引号、数字字段裸写；模板必须以 `{ }` 或 `[ ]` 包裹，占位符名必须在白名单内——两者都在建表期校验，避免「告警发出去但字段永远缺失」。
+1. **边沿触发，一次故障只推一条**。计数「恰好等于」阈值那一批推，之后继续降级不再重复推——否则持续故障会每 n 批推一条，把 Kafka 变成另一个日志洪峰。重新武装的唯一条件是**主源成功一批**；故障是否仍在持续，看统计日志的 `降级=` 与限流 WARN。
+2. **并行度会放大条数**。计数是每个子任务独立的，并行度 4 时同一次故障最多 4 条（各自在第 n 批触发），消息里带 `subtask`，下游按「表 + 时间窗」去重即可。`n × 单批耗时 ≈ 容忍时长`：`lookup.timeout=500ms` 下 10 批 ≈ 5 秒、60 批 ≈ 30 秒。
+3. **旁路保障**：投递在独立守护线程 + 有界队列里做，`send()` 只入队——`KafkaProducer.send()` 在元数据不可用时最长阻塞 60 秒，直接在降级回调里调会把维表查询拖死。Kafka 不可达、队列打满（丢一条 WARN）、生产者创建失败，都只影响告警，**不影响任何一次查询**。
+4. **模板规则**：占位符替换成**已做 JSON 转义、不含引号**的内容，所以字符串字段自己加引号、数字字段裸写；模板必须以 `{}` 或 `[]` 包裹，占位符名须在白名单内——两者都在建表期校验，避免「告警发出去但字段永远缺失」。
 
-> 关闭方式：`lookup.alert.threshold = 0`（默认）。此时既不会创建生产者，也不会起任何线程。
+> 关闭方式：`lookup.alert.threshold = 0`（默认），此时不创建生产者、不起任何线程。
 
 ## 11. 调优
 
-```
-并发数       = QPS × 单次延迟
-有效批大小   = min(batch.size, 每子任务QPS × batch.max-wait)
-算子吞吐上限 ≈ buffer-capacity × 并行度 ÷ 端到端延迟
-```
+`并发数 = QPS × 单次延迟`，`算子吞吐上限 ≈ buffer-capacity × 并行度 ÷ 端到端延迟`（有效批大小公式见 6.1）。
 
-2000 QPS、并行度 4：`max-wait=5ms` 时每子任务只能攒到 2.5 条/批（约 800 SQL/秒）；调到 30~50ms 后降到 40~67 SQL/秒。`buffer-capacity` 默认 100，高 QPS 建议 300~500。
+2000 QPS、并行度 4：`max-wait=5ms` 时每子任务只攒到 2.5 条/批（约 800 SQL/秒）；调到 30~50ms 后降到 40~67 SQL/秒。`buffer-capacity` 默认 100，高 QPS 建议 300~500。
 
 | 场景 | 调整 |
 |---|---|
@@ -413,25 +340,23 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 | Doris 作主源 | `lookup.primary=doris`，`doris.pool.size` 调到 8~16 |
 | 两源数据不一致 | 用 `lookup_source` 做对比校验 |
 
-反模式：`lookup.timeout` 大于算子 timeout、`max-wait` 接近 `lookup.timeout`、`hbase.rpc.timeout`/`doris.connect.timeout` ≥ `lookup.timeout`、`batch.size=1`——**前四类建表期就会报错**。另外：备源要按**全量峰值**规划容量；多表 join 的总连接数 = Σ（每表并行度 × 每表 `pool.size`），小码表降到 2~4。
+反模式（`lookup.timeout` 大于算子 timeout、`max-wait` 接近 `lookup.timeout`、客户端超时 ≥ `lookup.timeout`、`batch.size=1`）在建表期就会被拦截，见 7.1。另外备源要按**全量峰值**规划容量；多表 join 总连接数 = Σ（每表并行度 × 每表 `pool.size`），小码表降到 2~4。
 
 ## 12. 排查
 
 | 现象 | 原因 / 方向 |
 |---|---|
-| 建表报找不到 `dual-lookup` factory | jar 没放到所有节点，或集群未重启 |
-| 建表报必须声明 PRIMARY KEY | 补 `PRIMARY KEY (...) NOT ENFORCED` |
-| 建表报未知配置项 | 参数拼错；`properties.*` 需要 1.2.0+（旧包用 `helper.validate()`） |
-| 建表报 `doris.jdbc-url 必填` | 备源是容错下限，即使主源 HBase 也必须配 |
-| **`NoSuchMethodError: FsTracer.get(...)`** | jar 混入另一世代 Hadoop → `jar tf ... \| grep -E 'org/apache/hadoop/(fs\|conf\|security)/'` 自查；见第 2 章 |
-| 备源空闲后首次降级报 `ConnectionClosedException` 且持续失败 | 已修复：连接健康检查 + 自动重建 + 重试一次；确认加载的是新 jar |
+| 建表报错：找不到 `dual-lookup` factory | jar 没放到所有节点，或集群未重启 |
+| 建表报错：必须声明 PRIMARY KEY / 未知配置项 / `doris.jdbc-url 必填` | 补 `PRIMARY KEY (...) NOT ENFORCED`；参数拼错（`properties.*` 需 1.2.0+）；备源是容错下限，即使主源 HBase 也必须配 |
+| **`NoSuchMethodError: FsTracer.get(...)`** | jar 混入另一世代 Hadoop → `jar tf ... \| grep 'org/apache/hadoop/'` 自查；见第 2 章 |
+| 备源空闲后首次降级报 `ConnectionClosedException` 且持续失败 | 已修复：健康检查 + 自动重建 + 重试一次；确认加载的是新 jar |
 | 一直降级但 HBase 正常 | `lookup.timeout` 小于实际 P99，或 region 预热点未生效 |
 | `命中率=` 偏低但 `失败=0` | rowkey 编码不一致 / 表被误删 / 备源同步延迟 |
 | HBase 数值或时间错乱 | 写入编码与 DDL 类型不匹配；TIMESTAMP 注意 p≤3 毫秒、p>3 微秒 |
 | Kerberos 报 `GSS initiate failed` | 先确认 Flink 全局 `security.kerberos.login.*` 生效；再查 `klist -kt`、时间差、`hbase.rpc.protection` |
 | `keytab 不可读` 但 Flink 登录正常 | 新版降级复用并 WARN；要显式用 keytab 则确认每台 TM 可读 |
-| 时间类型主键命中率偏低 | 新版已把 Timestamp/LocalDateTime 等归一化并截断到微秒；旧包需升级 |
-| 反复出现 `failed to push metrics to pushgateway` | 1.2.4+ 会静音该 logger；仍出现就确认加载的是新 jar、Flink 用 Log4j2 |
+| 时间类型主键命中率偏低 | 新版已把 Timestamp/LocalDateTime 归一化并截断到微秒；旧包需升级 |
+| 反复出现 `failed to push metrics to pushgateway` | 1.2.4+ 会静音该 logger；仍出现就确认加载新 jar、Flink 用 Log4j2 |
 | TaskManager 连接数过多 | 并行度 × `doris.pool.size` 超出 Doris 承载 |
 
 ## 13. 限制与演进
@@ -439,15 +364,11 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 - 单列族；不支持嵌套主键。
 - **无熔断器**：主源持续宕机时每批仍要等满 `lookup.timeout`。
 - HBase `open()` 同步阻塞，建连失败会阻塞该批；建连耗时不计入 `lookup_cost_ms` / `lookup.timeout`，但计入墙钟时间。
-- 降级粒度为整批。
-
-演进方向：熔断器 → 主备结果对账 → 新数据源（实现 `LookupReader` 即可）→ 接 Flink Metric（`FunctionContext.getMetricGroup()` 可用，无需改 `RichAsyncFunction`）。
+- 降级粒度为整批。**演进方向**：熔断器 → 主备结果对账 → 新数据源（实现 `LookupReader` 即可）→ 接 Flink Metric（`FunctionContext.getMetricGroup()` 可用，无需改 `RichAsyncFunction`）。
 
 ## 14. 开发与测试
 
-```bash
-mvn test          # 116 个用例；无外部依赖，可进 CI
-```
+`mvn test` 116 个用例，不依赖任何外部服务，可进 CI。
 
 | 类 | 职责 |
 |---|---|
@@ -462,33 +383,8 @@ mvn test          # 116 个用例；无外部依赖，可进 CI
 
 新增配置项要改三处：`DualLookupOptions` 加 Option 与字段、`Config.from` 赋值、`DualLookupTableSourceFactory.optionalOptions()` 登记。
 
-> `FailoverAlertNotifier` 与 `KafkaAlertSink` 拆开是为了可测：告警的计数/渲染逻辑用记录型 Sink 覆盖，不需要 broker；`KafkaAlertSink` 只验证「配置合法 + 调用不阻塞」。
-
 ## 15. 变更与升级要点
 
-### 15.1 v1.3（1.2.9 → 1.3.0）：连续降级告警
+**v1.3（1.2.9 → 1.3.0）**：新增 `lookup.alert.*` 五个参数（默认全关，**不配就没有任何行为变化**，可直接替换 jar）；fat jar 内置 kafka-clients 3.6.2，体积 29MB → 约 34MB，与集群已有的会重复但 child-first 不影响功能；排除 zstd/lz4/snappy（生产者固定 `compression.type=none`，要开压缩需同改 pom 与 `KafkaAlertSink`）。升级动作：重打 jar → 各节点 `$FLINK_HOME/lib` 删旧包换新包 → 重启集群；判别生效看统计日志的**配置回显行**里是否出现 `alert.threshold=`（仅启用时出现）。
 
-| 变化 | 影响 / 动作 |
-|---|---|
-| 新增 `lookup.alert.*` 五个参数 | 默认全关，**不配就没有任何行为变化**，可直接替换 jar |
-| 新增 `FailoverAlertNotifier` / `KafkaAlertSink` | 只在下游需要「主源连续挂掉时系统主动喊」时才启用 |
-| fat jar 内置 kafka-clients 3.6.2 | 体积 29MB → 约 34MB；与集群已有的 kafka-clients 会重复（child-first，不影响功能） |
-| 排除 zstd/lz4/snappy | 生产者固定 `compression.type=none`；要开压缩需同时改 pom 与 `KafkaAlertSink` |
-| 用例 95 → 116 | 新增告警计数/渲染/校验/接线与 Kafka 客户端配置烟测 |
-
-升级动作与其他版本相同：重打 jar → 各节点 `$FLINK_HOME/lib` 删旧包换新包 → 重启集群。判别新版是否生效：统计日志的**配置回显行**里应出现 `alert.threshold=`（仅启用时出现）。
-
-### 15.2 v1.2（1.1.x → 1.2.9）
-
-| 变化 | 影响 / 动作 |
-|---|---|
-| `string` 模式 DECIMAL 单主键改为 `toString()` | 写入端若用 `Bytes.toBytes(BigDecimal)`，改用 `rowkey.encoding=typed`，否则查不到 |
-| `lookup_cost_ms` 只统计查询阶段 | 不再包含 HBase 惰性建连/预热；与 `lookup.timeout` 口径一致 |
-| `lookup.timeout` 联动推导 | 未显式配置的 rpc/connect 超时自动跟随；显式参数优先 |
-| `doris.pool.size` 默认 8→4 | Doris 作主源时显式调到 8~16 |
-| `doris.query.timeout` 默认 1→0 | 不设 JDBC queryTimeout；显式值不再被 `lookup.timeout` 钳制 |
-| 统计日志中文化 | 新增 `子任务=i/N`、`业务数据量`；解析脚本需同步 |
-| `properties.*` 真正参与解析 | `properties.hbase.security.authentication` 等可生效；需 1.2.0+ |
-| 异步链路异常安全 | 单个 key 转换失败不再导致后续 Future 悬挂 |
-| TIMESTAMP 精度统一 | p≤3 毫秒、p>3 微秒；rowkey 与列值一致 |
-| PushGateway 日志静音 | JVM 级副作用，会隐藏真实推送失败；集群侧能改日志时优先集群侧 |
+**v1.2（1.1.x → 1.2.9）**：从 1.1.x 直升需逐项确认——DECIMAL 单主键改 `toString()`（写入端用 `Bytes.toBytes(BigDecimal)` 的须改 `typed`）、`lookup_cost_ms` 不含建连、超时联动推导、`doris.pool.size` 8→4 与 `doris.query.timeout` 1→0、统计日志中文化（解析脚本同步）、`properties.*` 生效、TIMESTAMP 精度统一（p≤3 毫秒 / p>3 微秒）。
