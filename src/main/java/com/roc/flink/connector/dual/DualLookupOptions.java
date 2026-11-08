@@ -9,6 +9,7 @@ import java.io.Serializable;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -168,6 +169,89 @@ public final class DualLookupOptions {
             ConfigOptions.key("lookup.failover.log-interval")
                     .intType()
                     .defaultValue(10);
+
+    // ==================== 连续降级告警（旁路推送 Kafka） ====================
+
+    /**
+     * 默认告警消息模板。
+     *
+     * <p>字段构成对应运维真正会问的四个问题：<b>哪张表</b>（table）、<b>哪个源不行了</b>
+     * （primary → standby）、<b>严重到什么程度</b>（threshold/consecutive/affectedKeys）、
+     * <b>为什么</b>（reason）。{@code timestamp} 给机器排序去重用，{@code datetime} 给人看。
+     *
+     * <p>注意占位符都写在引号内（字符串字段），只有数字字段是裸写——渲染规则是
+     * 「占位符替换成已转义的裸内容」，带不带引号由模板作者决定。
+     */
+    public static final String DEFAULT_ALERT_MESSAGE =
+            "{\"alert\":\"dual-lookup-failover\",\"table\":\"${table}\",\"primary\":\"${primary}\","
+                    + "\"standby\":\"${standby}\",\"threshold\":${threshold},\"consecutive\":${consecutive},"
+                    + "\"affectedKeys\":${affectedKeys},\"reason\":\"${reason}\",\"subtask\":\"${subtask}\","
+                    + "\"timestamp\":${timestamp},\"datetime\":\"${datetime}\"}";
+
+    /**
+     * 连续降级批数阈值：连续这么多批都降级到备源时，推送一条告警到 Kafka。<b>0（默认）表示关闭</b>。
+     *
+     * <p><b>为什么用「连续」而不是「累计」？</b>主源偶发抖动几分钟就恢复了，累计口径会把
+     * 几小时里的零星降级攒成一次误报；连续口径只在「主源一直缓不过来」时触发——正是需要
+     * 人介入的那一类。主源任意一批成功都会清零计数，因此一次故障最多触发一次。
+     *
+     * <p><b>怎么定这个数？</b>它可以换算成「容忍主源抖动多久」：
+     * {@code n × 单批耗时 ≈ 容忍时长}。按默认 {@code lookup.timeout=500ms} 算，10 批 ≈ 5 秒、
+     * 60 批 ≈ 30 秒。夜间告警可设大些（如 60），核心链路设小些（如 10）。
+     *
+     * <p><b>并行度会放大条数</b>：计数是<b>每个并行子任务独立</b>的，并行度 4 时同一次故障最多
+     * 会收到 4 条（各自在第 n 批触发）。消息里带 {@code subtask} 字段，便于下游按
+     * 「表 + 时间窗」去重；不想收到多条就把阈值调大，让各子任务错开触发时间。
+     */
+    public static final ConfigOption<Integer> ALERT_THRESHOLD =
+            ConfigOptions.key("lookup.alert.threshold")
+                    .intType()
+                    .defaultValue(0);
+
+    /** Kafka 集群地址（如 {@code localhost:9092}，多个用逗号分隔）；{@code lookup.alert.threshold > 0} 时必填 */
+    public static final ConfigOption<String> ALERT_KAFKA_BOOTSTRAP =
+            ConfigOptions.key("lookup.alert.kafka.bootstrap-servers")
+                    .stringType()
+                    .noDefaultValue();
+
+    /** 告警消息的目标 topic；{@code lookup.alert.threshold > 0} 时必填 */
+    public static final ConfigOption<String> ALERT_KAFKA_TOPIC =
+            ConfigOptions.key("lookup.alert.kafka.topic")
+                    .stringType()
+                    .noDefaultValue();
+
+    /**
+     * 告警消息模板（JSON），支持 {@code ${占位符}}；缺省用 {@link #DEFAULT_ALERT_MESSAGE}。
+     *
+     * <p>可用占位符：{@code table}、{@code primary}、{@code standby}、{@code threshold}、
+     * {@code consecutive}、{@code affectedKeys}、{@code reason}、{@code subtask}、
+     * {@code timestamp}（epoch 毫秒）、{@code datetime}（ISO-8601 带时区）。
+     *
+     * <p>三个使用要点：
+     * <ul>
+     *   <li>占位符会被替换成<b>已做 JSON 转义的内容</b>（不含引号），所以字符串字段要自己加引号，
+     *       数字字段直接裸写；</li>
+     *   <li>模板整体必须以 <code>{ }</code> 或 <code>[ ]</code> 包裹，占位符名必须在白名单内——
+     *       两者都在建表期校验，写错直接报错，不会出现「告警发出去但字段永远缺失」；</li>
+     *   <li>在 SQL 里用单引号包裹整个模板，内部一律用双引号。</li>
+     * </ul>
+     */
+    public static final ConfigOption<String> ALERT_KAFKA_MESSAGE =
+            ConfigOptions.key("lookup.alert.kafka.message")
+                    .stringType()
+                    .defaultValue(DEFAULT_ALERT_MESSAGE);
+
+    /**
+     * 生产者 {@code acks}，默认 {@code 1}（leader 落盘即返回）。
+     *
+     * <p>告警不需要金融级的持久性，要的是尽快送达；改 {@code all} 会更可靠但更慢，
+     * 故障期间反而容易在队列里堆积。注意本连接器显式关闭了幂等（幂等要求 {@code acks=all}），
+     * 因此默认值不会导致生产者启动失败。
+     */
+    public static final ConfigOption<String> ALERT_KAFKA_ACKS =
+            ConfigOptions.key("lookup.alert.kafka.acks")
+                    .stringType()
+                    .defaultValue("1");
 
     // ==================== HBase ====================
 
@@ -418,6 +502,12 @@ public final class DualLookupOptions {
         public int statsLogIntervalSec; // 统计日志间隔（秒），0 关闭；日志数值为本阶段增量而非累计
         public int failoverLogIntervalSec; // 降级日志最小间隔（秒），0 不限流
 
+        public int alertThreshold;         // 连续降级批数阈值，0 = 关闭告警
+        public String alertKafkaBootstrap; // 告警 Kafka 地址（逗号分隔）
+        public String alertKafkaTopic;     // 告警 topic
+        public String alertKafkaMessage;   // 告警 JSON 模板（含 ${占位符}）
+        public String alertKafkaAcks;      // 生产者 acks
+
         public String hbaseTableName;
         public String hbaseZkQuorum;
         public String hbaseZkPort;
@@ -524,6 +614,13 @@ public final class DualLookupOptions {
             cfg.statsLogIntervalSec = c.get(STATS_LOG_INTERVAL);
             cfg.failoverLogIntervalSec = c.get(FAILOVER_LOG_INTERVAL);
 
+            // 告警是旁路：未启用时下面四个字段可能为空，运行期也就不会构造任何 Kafka 对象
+            cfg.alertThreshold = c.get(ALERT_THRESHOLD);
+            cfg.alertKafkaBootstrap = c.getOptional(ALERT_KAFKA_BOOTSTRAP).orElse("").trim();
+            cfg.alertKafkaTopic = c.getOptional(ALERT_KAFKA_TOPIC).orElse("").trim();
+            cfg.alertKafkaMessage = c.get(ALERT_KAFKA_MESSAGE);
+            cfg.alertKafkaAcks = c.get(ALERT_KAFKA_ACKS).trim().toLowerCase(Locale.ROOT);
+
             // getOptional(...).orElse(ddlTableName)：表名支持「不配就与 DDL 表名同名」的快捷写法
             cfg.hbaseTableName = c.getOptional(HBASE_TABLE_NAME).orElse(ddlTableName);
             cfg.hbaseZkQuorum = c.getOptional(HBASE_ZK_QUORUM).orElse("");
@@ -629,6 +726,37 @@ public final class DualLookupOptions {
                 throw new IllegalArgumentException(
                         "[dual-lookup] lookup.stats.log-interval 不能为负，0 表示关闭统计日志");
             }
+
+            // ---- 连续降级告警 ----
+            // 这里全部是「要么不配，要么配全」的校验：告警最怕的是配了个半成品——
+            // 主源真挂时才发现没配 topic，而那时已经没有补救的时机了
+            if (cfg.alertThreshold < 0) {
+                throw new IllegalArgumentException(
+                        "[dual-lookup] lookup.alert.threshold 不能为负，0 表示关闭连续降级告警");
+            }
+            if (cfg.alertThreshold > 0) {
+                if (cfg.alertKafkaBootstrap.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] 启用连续降级告警（lookup.alert.threshold=" + cfg.alertThreshold
+                                    + "）时必须配置 lookup.alert.kafka.bootstrap-servers");
+                }
+                if (cfg.alertKafkaTopic.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] 启用连续降级告警（lookup.alert.threshold=" + cfg.alertThreshold
+                                    + "）时必须配置 lookup.alert.kafka.topic");
+                }
+                // acks 写错会让 KafkaProducer 在「第一次要告警时」才抛配置异常——恰恰是最不该失败的时机，
+                // 因此提前到建表期，取值与 Kafka 的 acks 一致：0 / 1 / -1（或 all）
+                String acks = cfg.alertKafkaAcks.toLowerCase();
+                if (!"0".equals(acks) && !"1".equals(acks) && !"-1".equals(acks) && !"all".equals(acks)) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.kafka.acks 只能取值 0、1、all（或 -1），当前为: "
+                                    + cfg.alertKafkaAcks);
+                }
+            }
+            // 模板无条件校验：即使当前没启用告警，模板写错（占位符拼错、漏写花括号）也该立刻暴露，
+            // 而不是等到某天启用后才发现告警体是坏的——那时恰恰是故障现场
+            FailoverAlertNotifier.validateTemplate(cfg.alertKafkaMessage);
 
             // ---- 超时预算的四条交叉校验 ----
             // 这几个参数单独看都合法，组合起来才会失效，因此必须放在跨字段校验里拦（README 已把它们列为反模式）

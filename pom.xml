@@ -7,7 +7,7 @@
 
     <groupId>com.roc</groupId>
     <artifactId>flink-dual-lookup-connector</artifactId>
-    <version>1.2.9</version>
+    <version>1.3.0</version>
     <packaging>jar</packaging>
 
     <name>Flink Dual Lookup Connector (HBase / Doris 双源容错)</name>
@@ -15,7 +15,7 @@
     <!--
       ============================ 依赖版本策略 ============================
       本连接器的依赖只有一个原则：**Hadoop 与 Flink 一律由集群提供，fat jar 里只带 HBase 客户端、
-      Doris 驱动和连接池**。理由见 README「2. 环境要求」与「11. 常见问题排查」，这里只强调结论：
+      Doris 驱动、连接池与 Kafka 客户端（告警旁路用）**。理由见 README「2. 环境要求」与「12. 排查」，这里只强调结论：
 
       1) hadoop-common / hadoop-auth 用 provided：运行时必须与集群完全一致（当前生产 Hadoop 3.1.3）。
          一旦打进 jar，就会和集群的 Hadoop 形成「两个世代」——历史上正是这样撞出了
@@ -44,6 +44,9 @@
         <mysql.version>8.0.33</mysql.version>
         <!-- HikariCP 4.0.3 是兼容 Java 8 的最后一代；5.x 需要 Java 11+ -->
         <hikari.version>4.0.3</hikari.version>
+        <!-- 与 Flink 1.18 的 kafka connector 同代（3.x 客户端 API 自 2.x 起稳定）；
+             只用于「连续降级告警」这一个旁路生产者，不参与数据读取 -->
+        <kafka.version>3.6.2</kafka.version>
         <slf4j.version>1.7.36</slf4j.version>
         <junit.version>4.13.2</junit.version>
     </properties>
@@ -166,6 +169,45 @@
             <groupId>com.zaxxer</groupId>
             <artifactId>HikariCP</artifactId>
             <version>${hikari.version}</version>
+        </dependency>
+
+        <!--
+          Kafka 客户端：仅服务于「连续降级告警」这个旁路（lookup.alert.* 全关时不会创建任何 Kafka 对象）。
+
+          为什么直接依赖 kafka-clients，而不是 flink-connector-kafka：
+          后者是 Source/Sink 的运行时框架，会连带拖入 Flink 内部 API 与更严的版本约束；
+          这里只需要一个 `new KafkaProducer(...).send(...)`。
+
+          ⚠️ 排除三个压缩库（zstd-jni / lz4-java / snappy-java）：
+             它们在 kafka-clients 里只在「启用对应压缩算法」时才会被加载。本连接器把
+             compression.type 固定为 none（见 KafkaAlertSink），因此可以安全排除，省约 8MB。
+             若将来要开压缩，必须同时去掉这里的 exclusion，否则运行期 NoClassDefFoundError。
+             单元测试用同一套 classpath（无这三个库）构造真实 Producer，等于给这条假设上了回归。
+
+          排除 slf4j-api：上面已按 provided 声明，避免 fat jar 里出现第二份日志门面。
+        -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>${kafka.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.github.luben</groupId>
+                    <artifactId>zstd-jni</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.lz4</groupId>
+                    <artifactId>lz4-java</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.xerial.snappy</groupId>
+                    <artifactId>snappy-java</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- ================= 测试（test scope，不会进 fat jar） ================= -->

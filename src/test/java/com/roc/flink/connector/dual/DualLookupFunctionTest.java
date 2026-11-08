@@ -393,6 +393,57 @@ public class DualLookupFunctionTest {
         return (LookupStats) f.get(fn);
     }
 
+    /** 反射替换告警旁路：让它指向测试用的 RecordingSink，避免依赖真实 Kafka */
+    private static void injectNotifier(DualLookupFunction fn, FailoverAlertNotifier notifier) throws Exception {
+        java.lang.reflect.Field f = DualLookupFunction.class.getDeclaredField("alertNotifier");
+        f.setAccessible(true);
+        f.set(fn, notifier);
+    }
+
+    /**
+     * 接线测试：确认「连续降级」计数真的挂在主备路由上，且主源恢复后会重新计数。
+     *
+     * <p>只测 {@link FailoverAlertNotifier} 证明不了 {@code doBatchLookup} 调了它——那两处调用
+     * 一旦被删掉或挪错位置，纯逻辑测试仍然全绿，而线上再也收不到告警。这里注入 RecordingSink
+     * 跑真实降级链路，同时验证「未到阈值不推」「恢复后重新武装」两个只靠单测看不出问题的行为。
+     */
+    @Test
+    public void consecutiveFailoversPushAlertAndRearmAfterRecovery() throws Exception {
+        RecordingReader primary = new RecordingReader();
+        primary.failWith = new RuntimeException("primary down");
+        RecordingReader standby = new RecordingReader();
+        DualLookupFunction fn = newFunction(primary, standby, 1, 1000); // batchSize=1 -> 每个 key 独立成批
+
+        // open() 只初始化运行期状态、不建任何连接；随后把 Kafka 旁路换成记录器
+        fn.open(null);
+        FailoverAlertNotifierTest.RecordingSink sink = new FailoverAlertNotifierTest.RecordingSink();
+        injectNotifier(fn, new FailoverAlertNotifier("dim_account", "hbase", "doris", "1/1", 2,
+                DualLookupOptions.DEFAULT_ALERT_MESSAGE, sink));
+
+        fn.asyncLookup(key("a")).get(3, TimeUnit.SECONDS);
+        assertEquals("第 1 批降级：未到阈值，不应推送", 0, sink.payloads.size());
+
+        fn.asyncLookup(key("b")).get(3, TimeUnit.SECONDS);
+        assertEquals("第 2 批降级：达到阈值，必须推送一条", 1, sink.payloads.size());
+        assertTrue("告警体应带上表名: " + sink.payloads.get(0),
+                sink.payloads.get(0).contains("\"table\":\"dim_account\""));
+        assertEquals("告警不能影响数据链路：两批都应真的查了备源", 2, standby.calls.get());
+
+        // 主源恢复一批 -> 计数复位
+        primary.failWith = null;
+        fn.asyncLookup(key("c")).get(3, TimeUnit.SECONDS);
+
+        // 第二次故障必须从 1 重新数：若不复位，这里会直接越过阈值而漏报
+        primary.failWith = new RuntimeException("primary down again");
+        fn.asyncLookup(key("d")).get(3, TimeUnit.SECONDS);
+        assertEquals("恢复后应重新计数，不能沿用上一轮的计数", 1, sink.payloads.size());
+        fn.asyncLookup(key("e")).get(3, TimeUnit.SECONDS);
+        assertEquals("第二轮达到阈值后应再次推送", 2, sink.payloads.size());
+
+        fn.close();
+        assertTrue("算子关闭时应收尾告警通道", sink.closed);
+    }
+
     /**
      * 单个 key 的类型转换失败不得中断整批。
      *

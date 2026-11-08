@@ -117,6 +117,12 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         optional.add(DualLookupOptions.BATCH_MAX_WAIT);
         optional.add(DualLookupOptions.STATS_LOG_INTERVAL);
         optional.add(DualLookupOptions.FAILOVER_LOG_INTERVAL);
+        // 连续降级告警（旁路推 Kafka）：不登记就会被 validate() 判为未知配置
+        optional.add(DualLookupOptions.ALERT_THRESHOLD);
+        optional.add(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP);
+        optional.add(DualLookupOptions.ALERT_KAFKA_TOPIC);
+        optional.add(DualLookupOptions.ALERT_KAFKA_MESSAGE);
+        optional.add(DualLookupOptions.ALERT_KAFKA_ACKS);
 
         // HBase 连接与超时
         optional.add(DualLookupOptions.HBASE_TABLE_NAME);

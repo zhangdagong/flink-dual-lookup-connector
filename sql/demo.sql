@@ -104,6 +104,20 @@ CREATE TABLE dim_account (
     'lookup.stats.log-interval'    = '360',  -- 每 6 分钟一行统计（排查期可临时调 10~30）
     'lookup.failover.log-interval' = '10',   -- 降级 WARN 最小间隔（秒）；0 = 不限流，逐批打印
 
+    -- ===== 连续降级告警（可选，v1.3+；默认关闭）=====
+    -- 语义：主源任意一批成功即清零；连续 N 批都降级到备源时，推一条 JSON 到 Kafka。
+    -- 一次故障只推一条（边沿触发）；并行度 4 时最多收到 4 条，消息里带 subtask 便于去重。
+    -- 'lookup.alert.threshold'               = '10',      -- 连续降级批数；0 = 关闭（默认）
+                                                          -- 物理含义 ≈ 容忍主源抖动 N × 单批耗时
+    -- 'lookup.alert.kafka.bootstrap-servers' = 'localhost:9092',
+    -- 'lookup.alert.kafka.topic'             = 'dual_lookup_alert',
+    -- 'lookup.alert.kafka.acks'              = '1',        -- 0 | 1 | all
+    -- 自定义消息（可选；在 SQL 里用单引号包整个模板，内部一律双引号）。
+    -- 占位符：table primary standby threshold consecutive affectedKeys reason subtask timestamp datetime
+    -- 占位符替换成「已转义的内容、不含引号」：字符串字段自己加引号，数字字段裸写。
+    -- 'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},'
+    --                                + '"keys":${affectedKeys},"reason":"${reason}"}',
+
     -- ===== HBase =====
     'hbase.zookeeper.quorum'            = '127.0.0.1',
     'hbase.zookeeper.property.clientPort' = '2181',

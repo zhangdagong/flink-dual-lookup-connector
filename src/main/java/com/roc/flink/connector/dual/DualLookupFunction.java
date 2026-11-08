@@ -111,6 +111,14 @@ public class DualLookupFunction extends AsyncLookupFunction {
     private transient LookupStats stats;
     /** 降级日志限流闸门（主源长故障时把 WARN 洪峰压平） */
     private transient FailoverLogGate failoverGate;
+    /**
+     * 连续降级告警器（旁路推 Kafka）；未启用时为 {@code null}。
+     *
+     * <p>声明成 volatile 有两个原因：① 它在 {@code ensureOpened()} 里赋值，而读取发生在各源的
+     * IO 回调线程上，需要可见性保证；② 热路径只是读一次引用判空，volatile 读的代价可以忽略，
+     * 却换来「不需要额外同步」的简单性。
+     */
+    private transient volatile FailoverAlertNotifier alertNotifier;
     /** 是否已完成初始化（保证 ensureOpened 幂等） */
     private transient volatile boolean initialized;
     /** 并行子任务标识（如 1/4），由 open(FunctionContext) 解析；拿不到时为空 */
@@ -240,6 +248,9 @@ public class DualLookupFunction extends AsyncLookupFunction {
         stats.start();
         // 限流间隔从「秒」换算成「毫秒」；<=0 时闸门退化为不限流（visit 恒返回 >=0）
         failoverGate = new FailoverLogGate(cfg.failoverLogIntervalSec * 1000L);
+        // 告警器同样是「装配即可用」：未启用（threshold<=0）时返回 null，热路径只多一次判空；
+        // 启用时也只构造对象，Kafka 生产者要等第一次真正触发才创建（见 KafkaAlertSink）
+        alertNotifier = FailoverAlertNotifier.create(cfg, tableName, subtaskLabel);
         initialized = true;
     }
 
@@ -257,7 +268,11 @@ public class DualLookupFunction extends AsyncLookupFunction {
                 + " batch.max-wait=" + cfg.batchMaxWaitMs + "ms"
                 + " lookup.timeout=" + cfg.timeoutMs + "ms"
                 + " stats.interval=" + cfg.statsLogIntervalSec + "s"
-                + " failover.interval=" + cfg.failoverLogIntervalSec + "s";
+                + " failover.interval=" + cfg.failoverLogIntervalSec + "s"
+                // 告警只在启用时才出现在回执里：默认配置的日志行不该被一串「未启用」的字段占满
+                + (cfg.alertThreshold > 0
+                        ? " alert.threshold=" + cfg.alertThreshold + " alert.topic=" + cfg.alertKafkaTopic
+                        : "");
     }
 
     /**
@@ -384,6 +399,7 @@ public class DualLookupFunction extends AsyncLookupFunction {
                     if (failure == null) {
                         // 主源正常返回（包含「查不到」的情况，那是正常业务结果，不算失败）
                         infoRecovered();
+                        notifyPrimarySuccess();
                         distribute(futures, resultMap, cfg.primary, toMillis(primaryCostNanos),
                                 queryableKeys);
                         return;
@@ -393,6 +409,7 @@ public class DualLookupFunction extends AsyncLookupFunction {
                     stats.recordPrimaryFail(cause);          // 顺带按异常类型归类（超时/连接/池满/…）
                     stats.recordFailover(queryableKeys);     // 记 key 数：降级"影响多少条记录"比"降了几批"更有信息量
                     warnFailover(keys.size(), cause);
+                    notifyFailover(queryableKeys, cause);    // 连续降级达阈值时推一次 Kafka 告警（旁路）
 
                     // 备源耗时同样只从「真正发起备源查询」时起算，不含前面等主源超时的那段时间
                     long[] standbyStartNanos = new long[1];
@@ -470,6 +487,44 @@ public class DualLookupFunction extends AsyncLookupFunction {
         failoverGate.reset(); // 先清零，再打日志：避免日志线程异常导致状态残留
         LOG.info("[dual-lookup] 主源 {} 已恢复，重新由主源提供数据（本次故障共降级 {} 批）",
                 cfg.primary, totalFailovers);
+    }
+
+    /**
+     * 主源恢复成功：让「连续降级」告警重新武装。
+     *
+     * <p>为什么复位放在这里而不是「推完就复位」：告警的语义是「主源连续 N 批没缓过来」，
+     * 只要还在降级就仍处于同一个故障周期。若推完即复位，持续故障会每 N 批推一条，
+     * 几分钟就能把 Kafka 灌成另一个日志洪峰——这正是降级 WARN 当初要限流的原因。
+     */
+    private void notifyPrimarySuccess() {
+        FailoverAlertNotifier notifier = alertNotifier;
+        if (notifier == null) {
+            return;
+        }
+        try {
+            notifier.onPrimarySuccess();
+        } catch (Throwable ignored) {
+            // 旁路：复位失败最多导致「本轮不再重复推送」，不影响任何一次查询
+        }
+    }
+
+    /**
+     * 记一次降级，供「连续 N 批降级」告警使用。
+     *
+     * <p>为什么不把这个调用塞进 {@code warnFailover} 里：日志与告警是两条独立通道，
+     * 限流参数（{@code lookup.failover.log-interval}）不该影响告警计数——把两者绑在一起，
+     * 调整日志限流就会悄悄改变告警时机，这种耦合在故障复盘时极难还原。
+     */
+    private void notifyFailover(int keys, Throwable cause) {
+        FailoverAlertNotifier notifier = alertNotifier;
+        if (notifier == null) {
+            return;
+        }
+        try {
+            notifier.onFailover(keys, cause);
+        } catch (Throwable ignored) {
+            // 同上：告警出任何问题都不能冒泡到降级链路
+        }
     }
 
     /**
@@ -646,6 +701,11 @@ public class DualLookupFunction extends AsyncLookupFunction {
         }
         if (stats != null) {
             stats.close();
+        }
+        // 告警旁路收尾：尽力把已触发的消息冲出去（有超时上限），再释放生产者。
+        // 放在 Reader 关闭之前无害，但必须显式关闭——否则 Kafka 生产者线程会一直挂着
+        if (alertNotifier != null) {
+            alertNotifier.close();
         }
         if (batchScheduler != null) {
             batchScheduler.shutdownNow();

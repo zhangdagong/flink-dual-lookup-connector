@@ -421,4 +421,93 @@ public class DualLookupOptionsTest {
             assertTrue(e.getMessage().contains("HikariCP"));
         }
     }
+
+    // ==================== 连续降级告警 ====================
+
+    @Test
+    public void alertIsDisabledByDefault() {
+        DualLookupOptions.Config cfg = parse(base());
+        // 默认关闭是硬要求：未启用告警的作业不该为此多一个线程、一个生产者、一次网络连接
+        assertEquals(0, cfg.alertThreshold);
+        assertEquals("", cfg.alertKafkaBootstrap);
+        assertEquals("", cfg.alertKafkaTopic);
+        assertEquals("1", cfg.alertKafkaAcks);
+        assertEquals(DualLookupOptions.DEFAULT_ALERT_MESSAGE, cfg.alertKafkaMessage);
+    }
+
+    @Test
+    public void alertThresholdRejectsNegative() {
+        // 负数与 0 行为上无法区分（都等于关闭），与其静默照做不如拦下
+        Configuration c = base();
+        c.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), -1);
+        assertRejected(c, "lookup.alert.threshold");
+    }
+
+    /**
+     * 「要么不配，要么配全」：只写阈值不写 Kafka 地址/topic，会在主源真挂的那一刻才发现告警发不出去——
+     * 那正是最没有补救时机的时刻，所以必须建表期失败。
+     */
+    @Test
+    public void alertEnabledRequiresBootstrapAndTopic() {
+        Configuration noBootstrap = base();
+        noBootstrap.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 10);
+        assertRejected(noBootstrap, "lookup.alert.kafka.bootstrap-servers");
+
+        Configuration noTopic = base();
+        noTopic.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 10);
+        noTopic.setString(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP.key(), "localhost:9092");
+        assertRejected(noTopic, "lookup.alert.kafka.topic");
+    }
+
+    @Test
+    public void alertConfigIsParsedWhenComplete() {
+        Configuration c = base();
+        c.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 10);
+        c.setString(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP.key(), " 10.0.0.1:9092,10.0.0.2:9092 ");
+        c.setString(DualLookupOptions.ALERT_KAFKA_TOPIC.key(), "dual_lookup_alert");
+        c.setString(DualLookupOptions.ALERT_KAFKA_ACKS.key(), "ALL");
+
+        DualLookupOptions.Config cfg = parse(c);
+
+        assertEquals(10, cfg.alertThreshold);
+        assertEquals("地址首尾空格应被归一化", "10.0.0.1:9092,10.0.0.2:9092", cfg.alertKafkaBootstrap);
+        assertEquals("dual_lookup_alert", cfg.alertKafkaTopic);
+        assertEquals("ACKS 统一归一化成小写，运行期只有一种写法", "all", cfg.alertKafkaAcks);
+    }
+
+    /**
+     * 模板即使在「告警未启用」时也校验：模板写错（占位符拼错）不会报任何错，
+     * 只会让告警字段永远缺失——而告警很少成功触发，这类问题几乎不可能被人工发现。
+     */
+    @Test
+    public void alertTemplateRejectsUnknownPlaceholderEvenWhenDisabled() {
+        Configuration c = base();
+        c.setString(DualLookupOptions.ALERT_KAFKA_MESSAGE.key(), "{\"n\":${consecutvie}}");
+        assertRejected(c, "未知占位符");
+    }
+
+    @Test
+    public void alertTemplateMustBeJsonLike() {
+        Configuration c = base();
+        c.setString(DualLookupOptions.ALERT_KAFKA_MESSAGE.key(), "主源连续降级 ${consecutive} 批");
+        assertRejected(c, "JSON");
+    }
+
+    /** acks 写错会让 KafkaProducer 在第一次告警时抛配置异常，必须提前到建表期 */
+    @Test
+    public void alertAcksOnlyAcceptsKnownValues() {
+        Configuration bad = base();
+        bad.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 5);
+        bad.setString(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP.key(), "localhost:9092");
+        bad.setString(DualLookupOptions.ALERT_KAFKA_TOPIC.key(), "t");
+        bad.setString(DualLookupOptions.ALERT_KAFKA_ACKS.key(), "ALL_ISR");
+        assertRejected(bad, "lookup.alert.kafka.acks");
+
+        Configuration ok = base();
+        ok.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 5);
+        ok.setString(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP.key(), "localhost:9092");
+        ok.setString(DualLookupOptions.ALERT_KAFKA_TOPIC.key(), "t");
+        ok.setString(DualLookupOptions.ALERT_KAFKA_ACKS.key(), "all");
+        assertEquals("all", parse(ok).alertKafkaAcks);
+    }
 }

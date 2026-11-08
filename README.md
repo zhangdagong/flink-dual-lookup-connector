@@ -32,7 +32,8 @@ asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBas
 | HBase | **2.2.7** | `hbase-shaded-client-**byo-hadoop**`，原生异步客户端 |
 | Hadoop | **3.1.3** | 集群提供；`hadoop-common`/`hadoop-auth` 仅 `provided`，**不打进 jar** |
 | Doris | 4.0.8 | MySQL 协议（JDBC + HikariCP），2.x/3.x 也适用 |
-| 构建 | Maven 3.6+ | shade 打 fat jar（约 29MB） |
+| Kafka | 3.x（客户端已内置） | **仅告警旁路用**，不参与数据读取；不打进 jar 时也可由集群提供 |
+| 构建 | Maven 3.6+ | shade 打 fat jar（约 34MB） |
 
 三条硬约束：
 
@@ -40,6 +41,12 @@ asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBas
   `NoSuchMethodError: org.apache.hadoop.fs.FsTracer.get(...)Lorg/apache/htrace/core/Tracer;`（jar 内置 Hadoop 3.4.1，生产 3.1.3，`FsTracer` 返回类型不同）。
 - **htrace 由 Hadoop 提供**：HBase 引用的 `org.apache.htrace.core.Tracer` 必须与 Hadoop 的 `FsTracer` 是同一个类，所以 `htrace-core4` 也不打进 jar。hadoop-free 部署需手动补进 `lib/`。
 - **HikariCP 4.0.3**：兼容 Java 8 的最后一代（5.x 需 Java 11+）。
+
+关于内置的 Kafka 客户端（v1.3+）：
+
+- 只为「连续降级告警」服务（第 10.1 节）。`lookup.alert.threshold = 0`（默认）时不会创建任何 Kafka 对象。
+- 打包时排除了 `zstd-jni` / `lz4-java` / `snappy-java` 三个压缩库（省约 8MB），前提是生产者固定 `compression.type=none`。**要开压缩必须同时改 pom 与 `KafkaAlertSink`**。
+- 若集群 `lib/` 里已有 `flink-connector-kafka` 带来的 kafka-clients，会出现同名类；Flink 的用户代码类加载器默认 child-first，连接器用的仍是自己这份。介意重复可把 pom 里该依赖改成 `provided`，由集群提供。
 
 ```bash
 # 确认集群 Hadoop 世代
@@ -51,20 +58,20 @@ javap -classpath $FLINK_HOME/lib/hadoop-common-*.jar org.apache.hadoop.fs.FsTrac
 ## 3. 构建与部署
 
 ```bash
-mvn test                          # 95 个用例，不依赖任何外部服务
+mvn test                          # 116 个用例，不依赖任何外部服务
 mvn clean package
 
 # 产物体检：有输出就说明 jar 混入了本应由集群提供的类
-jar tf target/flink-dual-lookup-connector-1.2.9.jar \
+jar tf target/flink-dual-lookup-connector-1.3.0.jar \
   | grep -E 'org/apache/hadoop/(fs|conf|security)/|org/apache/htrace/' \
   && echo '✗ jar 被污染' || echo '✓ jar 干净'
 
 rm $FLINK_HOME/lib/flink-dual-lookup-connector-1.*.jar    # 旧包必须删，JM 与所有 TM
-cp target/flink-dual-lookup-connector-1.2.9.jar $FLINK_HOME/lib/
+cp target/flink-dual-lookup-connector-1.3.0.jar $FLINK_HOME/lib/
 $FLINK_HOME/bin/stop-cluster.sh && $FLINK_HOME/bin/start-cluster.sh
 ```
 
-> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里，产物约 **29MB**（旧版带 Hadoop 时 65MB）。
+> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里，产物约 **34MB**（1.2.x 为 29MB，多出的是 Kafka 客户端；旧版带 Hadoop 时 65MB）。
 > 从 1.1.x 升级时先看第 15 章的「升级要点」。
 
 ## 4. 最小示例
@@ -256,6 +263,18 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 
 > `doris.query.timeout` 只管 JDBC/服务端查询能跑多久，业务降级仍由 `lookup.timeout` 控制：到点 Future 失败并 `Statement.cancel()` 中止 SQL。
 
+### 7.5 连续降级告警
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `lookup.alert.threshold` | `0` | 连续降级批数阈值；`0` = 关闭（不建线程、不建生产者） |
+| `lookup.alert.kafka.bootstrap-servers` | — | 阈值 > 0 时**必填** |
+| `lookup.alert.kafka.topic` | — | 阈值 > 0 时**必填** |
+| `lookup.alert.kafka.message` | 内置 JSON | 消息模板，占位符见 10.1；建表期校验 |
+| `lookup.alert.kafka.acks` | `1` | `0` / `1` / `all`；生产者已关幂等，不会与 acks 冲突 |
+
+语义、示例消息与注意事项见 **10.1**。三条建表期校验：阈值为负直接报错；启用但缺 bootstrap/topic 报错；模板不是 JSON 或含未知占位符报错。
+
 ## 8. 内置元字段
 
 在维表 DDL 里声明这两个约定名，即可拿到每次 Lookup 的元信息；它们不查后端，TableSource 会自动从查询列中剥离。
@@ -337,6 +356,45 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 > 这是 **JVM 级副作用**（同 TM 所有作业共享），只对 Log4j2 有效，且会隐藏该 reporter 的全部日志（含真实推送失败）。
 > 集群侧能改 `log4j2.properties` 时，应优先在集群侧处理；否则可删掉连接器里的静音代码。
 
+### 10.1 连续降级告警（推 Kafka）
+
+日志要人去翻，告警要系统自己喊。`lookup.alert.threshold = n` 开启后：**主源任意一批成功即清零**，连续 n 批都降级到备源时，向 Kafka 推一条自定义 JSON。
+
+```sql
+'lookup.alert.threshold'               = '10',
+'lookup.alert.kafka.bootstrap-servers' = 'localhost:9092',
+'lookup.alert.kafka.topic'             = 'dual_lookup_alert',
+
+-- 可选：不写就用内置模板。在 SQL 里用单引号包整个模板，内部一律双引号
+'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},"keys":${affectedKeys},"reason":"${reason}"}'
+```
+
+默认模板渲染出来是这样（连续 10 批降级、波及 500 个 key）：
+
+```json
+{"alert":"dual-lookup-failover","table":"dim_account","primary":"hbase","standby":"doris","threshold":10,"consecutive":10,"affectedKeys":500,"reason":"TimeoutException: HBase lookup timeout after 500ms","subtask":"1/4","timestamp":1794141799631,"datetime":"2026-11-08T20:43:19.631+08:00"}
+```
+
+| 占位符 | 含义 |
+|---|---|
+| `${table}` | 维表名 |
+| `${primary}` / `${standby}` | 主源 / 备源（`hbase` / `doris`） |
+| `${threshold}` / `${consecutive}` | 配置阈值 / 触发时的连续批数 |
+| `${affectedKeys}` | 这几批一共波及多少 key（回答「影响多少条数据」） |
+| `${reason}` | 最近一次失败原因，`异常类名: message` |
+| `${subtask}` | 并行子任务号，如 `1/4`；无并行度信息时为空串 |
+| `${timestamp}` / `${datetime}` | epoch 毫秒 / 带时区 ISO-8601 |
+
+**五条容易踩的**：
+
+1. **边沿触发，一次故障只推一条**。计数「恰好等于」阈值那一批推，之后继续降级不再重复推——否则持续故障会每 n 批推一条，把 Kafka 变成另一个日志洪峰。故障是否仍在持续，看统计日志的 `降级=` 与限流 WARN。重新武装的唯一条件是**主源成功一批**。
+2. **并行度会放大条数**。计数是**每个子任务独立**的，并行度 4 时同一次故障最多收到 4 条（各自在第 n 批触发）。消息里带 `subtask`，下游按「表 + 时间窗」去重即可。
+3. **n 可以换算成「容忍主源抖动多久」**：`n × 单批耗时 ≈ 容忍时长`。默认 `lookup.timeout=500ms` 下，10 批 ≈ 5 秒、60 批 ≈ 30 秒。夜间告警调大、核心链路调小。
+4. **旁路保障**：投递在独立守护线程 + 有界队列里做，`send()` 本身只入队——因为 `KafkaProducer.send()` 在元数据不可用时最长可阻塞 60 秒，直接在降级回调里调用会把维表查询拖死。Kafka 不可达、队列打满（丢一条 WARN）、生产者创建失败，都只影响告警，**不影响任何一次查询**。
+5. **模板规则**：占位符替换成**已做 JSON 转义的内容（不含引号）**，所以字符串字段自己加引号、数字字段裸写；模板必须以 `{ }` 或 `[ ]` 包裹，占位符名必须在白名单内——两者都在建表期校验，避免「告警发出去但字段永远缺失」。
+
+> 关闭方式：`lookup.alert.threshold = 0`（默认）。此时既不会创建生产者，也不会起任何线程。
+
 ## 11. 调优
 
 ```
@@ -388,21 +446,39 @@ security.kerberos.login.principal: ro@EXAMPLE.COM
 ## 14. 开发与测试
 
 ```bash
-mvn test          # 95 个用例；无外部依赖，可进 CI
+mvn test          # 116 个用例；无外部依赖，可进 CI
 ```
 
 | 类 | 职责 |
 |---|---|
 | `DualLookupTableSourceFactory` | SPI 入口、配置校验、schema 提取 |
 | `DualLookupTableSource` | 装配 Reader 与 Function、剥离元字段 |
-| `DualLookupFunction` | 攒批 + 主备路由 + 降级日志限流 |
+| `DualLookupFunction` | 攒批 + 主备路由 + 降级日志限流 + 告警计数接线 |
 | `HBaseLookupReader` / `DorisLookupReader` | 单源批量查询（异步 / JDBC 模拟异步） |
 | `RowDataConverter` | Flink 内部值与 Java 对象双向转换 |
 | `LookupStats` | 定时统计日志 |
+| `FailoverAlertNotifier` | 连续降级计数、阈值边沿触发、JSON 模板渲染与转义（不依赖 Kafka） |
+| `KafkaAlertSink` | 告警旁路：懒建生产者、单线程有界队列异步投递、失败不外溢 |
 
 新增配置项要改三处：`DualLookupOptions` 加 Option 与字段、`Config.from` 赋值、`DualLookupTableSourceFactory.optionalOptions()` 登记。
 
-## 15. v1.2 升级要点（1.1.x → 1.2.9）
+> `FailoverAlertNotifier` 与 `KafkaAlertSink` 拆开是为了可测：告警的计数/渲染逻辑用记录型 Sink 覆盖，不需要 broker；`KafkaAlertSink` 只验证「配置合法 + 调用不阻塞」。
+
+## 15. 变更与升级要点
+
+### 15.1 v1.3（1.2.9 → 1.3.0）：连续降级告警
+
+| 变化 | 影响 / 动作 |
+|---|---|
+| 新增 `lookup.alert.*` 五个参数 | 默认全关，**不配就没有任何行为变化**，可直接替换 jar |
+| 新增 `FailoverAlertNotifier` / `KafkaAlertSink` | 只在下游需要「主源连续挂掉时系统主动喊」时才启用 |
+| fat jar 内置 kafka-clients 3.6.2 | 体积 29MB → 约 34MB；与集群已有的 kafka-clients 会重复（child-first，不影响功能） |
+| 排除 zstd/lz4/snappy | 生产者固定 `compression.type=none`；要开压缩需同时改 pom 与 `KafkaAlertSink` |
+| 用例 95 → 116 | 新增告警计数/渲染/校验/接线与 Kafka 客户端配置烟测 |
+
+升级动作与其他版本相同：重打 jar → 各节点 `$FLINK_HOME/lib` 删旧包换新包 → 重启集群。判别新版是否生效：统计日志的**配置回显行**里应出现 `alert.threshold=`（仅启用时出现）。
+
+### 15.2 v1.2（1.1.x → 1.2.9）
 
 | 变化 | 影响 / 动作 |
 |---|---|
