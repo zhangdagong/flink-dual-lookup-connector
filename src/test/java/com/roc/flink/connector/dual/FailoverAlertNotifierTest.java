@@ -38,6 +38,77 @@ public class FailoverAlertNotifierTest {
                 threshold, DEFAULT, sink);
     }
 
+    private static FailoverAlertNotifier notifier(int threshold, Sink sink, long cooldownMs,
+                                                  String cooldownKey, boolean recovery) {
+        return new FailoverAlertNotifier("dim_account", "hbase", "doris", "1/4",
+                threshold, DEFAULT, sink, cooldownMs, cooldownKey, recovery, 5_000L,
+                AlertMetrics.NOOP);
+    }
+
+    private static FailoverAlertNotifier notifier(int threshold, Sink sink, long cooldownMs,
+                                                  String cooldownKey, boolean recovery,
+                                                  String recoveryTemplate) {
+        return new FailoverAlertNotifier("dim_account", "hbase", "doris", "1/4",
+                threshold, DEFAULT, sink, cooldownMs, cooldownKey, recovery, 5_000L,
+                AlertMetrics.NOOP, recoveryTemplate);
+    }
+
+    @Test
+    public void cooldownSuppressesRepeatWithinWindow() {
+        RecordingSink sink = new RecordingSink();
+        String key = "cooldown-" + System.nanoTime();
+        FailoverAlertNotifier n = notifier(1, sink, 60_000L, key, false);
+
+        n.onFailover(1, new RuntimeException("down"));
+        assertEquals(1, sink.payloads.size());
+
+        n.onPrimarySuccess(); // 结束本轮
+        n.onFailover(1, new RuntimeException("down again")); // 冷却窗口内
+        assertEquals("冷却窗口内不得重复推送", 1, sink.payloads.size());
+
+        // 直接清空 JVM 冷却表，避免依赖 sleep/机器速度；生产语义不变
+        FailoverAlertNotifier.clearCooldownForTests();
+        n.onPrimarySuccess();
+        n.onFailover(1, new RuntimeException("down after cooldown"));
+        assertEquals("冷却窗口结束后应能再次告警", 2, sink.payloads.size());
+    }
+
+    @Test
+    public void recoveryIsSentAfterAnAlertEpisode() {
+        RecordingSink sink = new RecordingSink();
+        FailoverAlertNotifier n = notifier(1, sink, 0L, "recovery-" + System.nanoTime(), true);
+
+        n.onFailover(3, new RuntimeException("down"));
+        n.onPrimarySuccess();
+
+        assertEquals("降级 + 恢复应各一条", 2, sink.payloads.size());
+        assertTrue("恢复消息要能被下游区分: " + sink.payloads.get(1),
+                sink.payloads.get(1).contains("\"alert\":\"dual-lookup-recovered\""));
+        assertEquals(0, n.currentStreak());
+    }
+
+    @Test
+    public void recoveryUsesCustomJsonTemplate() {
+        RecordingSink sink = new RecordingSink();
+        FailoverAlertNotifier n = notifier(1, sink, 0L, "recovery-custom-" + System.nanoTime(), true,
+                "{\"event\":\"recovered\",\"table\":\"${table}\",\"keys\":${affectedKeys}}");
+
+        n.onFailover(3, new RuntimeException("down"));
+        n.onPrimarySuccess();
+
+        assertEquals("{\"event\":\"recovered\",\"table\":\"dim_account\",\"keys\":0}",
+                sink.payloads.get(1));
+    }
+
+    @Test
+    public void closeIsIdempotent() {
+        RecordingSink sink = new RecordingSink();
+        FailoverAlertNotifier n = notifier(1, sink);
+        n.close();
+        n.close();
+        assertEquals("close 必须幂等", 1, sink.closeCalls);
+    }
+
     @Test
     public void firesExactlyAtThresholdAndOnlyOncePerEpisode() {
         RecordingSink sink = new RecordingSink();
@@ -220,6 +291,7 @@ public class FailoverAlertNotifierTest {
 
         final List<String> payloads = Collections.synchronizedList(new ArrayList<String>());
         volatile boolean closed;
+        int closeCalls;
 
         @Override
         public void send(String payload) {
@@ -229,6 +301,7 @@ public class FailoverAlertNotifierTest {
         @Override
         public void close(long timeoutMs) {
             closed = true;
+            closeCalls++;
         }
     }
 }

@@ -7,7 +7,7 @@
 
     <groupId>com.roc</groupId>
     <artifactId>flink-dual-lookup-connector</artifactId>
-    <version>1.3.0</version>
+    <version>1.4.0</version>
     <packaging>jar</packaging>
 
     <name>Flink Dual Lookup Connector (HBase / Doris 双源容错)</name>
@@ -174,9 +174,10 @@
         <!--
           Kafka 客户端：仅服务于「连续降级告警」这个旁路（lookup.alert.* 全关时不会创建任何 Kafka 对象）。
 
-          为什么直接依赖 kafka-clients，而不是 flink-connector-kafka：
-          后者是 Source/Sink 的运行时框架，会连带拖入 Flink 内部 API 与更严的版本约束；
-          这里只需要一个 `new KafkaProducer(...).send(...)`。
+          为什么是 provided：Flink 集群通常已经通过 flink-connector-kafka 把 kafka-clients 放在
+          $FLINK_HOME/lib。再把这个客户端打进连接器，会出现两份 kafka-clients，版本不一致时
+          可能导致 NoSuchMethodError/配置行为漂移。改由集群统一提供；如果集群没有 Kafka 客户端，
+          告警初始化会失败并打 WARN，但作业继续运行（旁路原则）。
 
           ⚠️ 排除三个压缩库（zstd-jni / lz4-java / snappy-java）：
              它们在 kafka-clients 里只在「启用对应压缩算法」时才会被加载。本连接器把
@@ -190,6 +191,7 @@
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
             <version>${kafka.version}</version>
+            <scope>provided</scope>
             <exclusions>
                 <exclusion>
                     <groupId>com.github.luben</groupId>

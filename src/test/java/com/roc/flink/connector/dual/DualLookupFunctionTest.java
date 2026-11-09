@@ -546,6 +546,28 @@ public class DualLookupFunctionTest {
         fn.close();
     }
 
+    /** 关闭后迟到的 asyncLookup 不能再 ensureOpened()，否则会重建线程池/连接并泄漏 */
+    @Test
+    public void lookupAfterCloseFailsWithoutReinitializing() throws Exception {
+        DualLookupFunction fn = newFunction(new RecordingReader(), new RecordingReader(), 10, 1000);
+        fn.close();
+
+        try {
+            fn.asyncLookup(key("late")).get(1, TimeUnit.SECONDS);
+            fail("关闭后的迟到查询应直接失败");
+        } catch (ExecutionException e) {
+            assertTrue("应返回 already closed: " + e.getCause(),
+                    e.getCause() instanceof IllegalStateException);
+        }
+    }
+
+    @Test
+    public void parsesSubtaskLabelFromFlinkTaskThreadName() {
+        assertEquals("3/4", DualLookupFunction.parseSubtaskLabel(
+                "Source: KafkaSource -> Calc(3/4)#0"));
+        assertEquals("", DualLookupFunction.parseSubtaskLabel("dual-lookup-alert"));
+    }
+
     /** 假 Reader：batchLookupAsync 返回一个由测试手动控制的 Future，模拟「查询在途」 */
     static class PendingReader implements LookupReader {
 

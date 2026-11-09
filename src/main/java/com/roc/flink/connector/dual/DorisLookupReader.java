@@ -125,40 +125,55 @@ public class DorisLookupReader implements LookupReader {
         if (opened) {
             return;
         }
-        dataSource = createDataSource();
+        HikariDataSource ds = createDataSource();
+        ThreadPoolExecutor queries = null;
+        ScheduledThreadPoolExecutor timeouts = null;
+        try {
+            // 线程数与连接池等大，保证拿到连接后不用排队等待。
+            // 这里用有界队列 + AbortPolicy：容量取「池大小 × 2」，持续过载时快速拒绝，
+            // 由上层把拒绝翻译成「该源本次查询失败」并降级。
+            queries = new ThreadPoolExecutor(
+                    cfg.dorisPoolSize, cfg.dorisPoolSize,
+                    0L, TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<>(Math.max(1, cfg.dorisPoolSize * 2)),
+                    r -> {
+                        Thread t = new Thread(r, "dual-lookup-doris-query");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    new ThreadPoolExecutor.AbortPolicy());
 
-        // 线程数与连接池等大，保证拿到连接后不用排队等待
-        // （若线程数 < 池大小，池里有空闲连接却没有线程去用，等于浪费；
-        //   若线程数 > 池大小，多出的线程会阻塞在 getConnection 上，白占线程）
-        //
-        // 为什么不用 Executors.newFixedThreadPool？它内部是无界队列，等于没有背压：
-        // Doris 变慢时每个任务都要等满 lookup.timeout 才「结束」（Future 早已异常完成，
-        // 但任务本身还在跑），上游却仍在按 QPS 提交，队列只增不减。每个排队任务都持有一整批
-        // 绑定参数，堆积既吃堆内存，又会在 Doris 恢复后集中涌去抢连接。
-        // 这里改成有界队列 + AbortPolicy：容量取「池大小 × 2」，足以吸收瞬时波动，
-        // 持续过载时则快速拒绝——拒绝会被翻译成「该源本次查询失败」，交给上层降级。
-        queryExecutor = new ThreadPoolExecutor(
-                cfg.dorisPoolSize, cfg.dorisPoolSize,
-                0L, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(Math.max(1, cfg.dorisPoolSize * 2)),
-                r -> {
-                    Thread t = new Thread(r, "dual-lookup-doris-query");
-                    t.setDaemon(true);
-                    return t;
-                },
-                new ThreadPoolExecutor.AbortPolicy());
+            timeouts = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread t = new Thread(r, "dual-lookup-doris-timeout");
+                t.setDaemon(true);
+                return t;
+            });
+            // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻
+            timeouts.setRemoveOnCancelPolicy(true);
 
-        timeoutScheduler = new ScheduledThreadPoolExecutor(1, r -> {
-            Thread t = new Thread(r, "dual-lookup-doris-timeout");
-            t.setDaemon(true);
-            return t;
-        });
-        // 取消即出队：默认策略下被取消的任务会滞留在队列里直到到期时刻，
-        // 高 QPS 时「查询早已完成」的超时任务仍会堆积；开启后 cancel(false) 立即释放队列空间
-        timeoutScheduler.setRemoveOnCancelPolicy(true);
-
-        // 放最后：任一步骤失败时 opened 仍为 false，下次查询会重新尝试
-        opened = true;
+            // 全部创建成功后再一次性发布，任一步失败都不会留下半初始化对象
+            this.dataSource = ds;
+            this.queryExecutor = queries;
+            this.timeoutScheduler = timeouts;
+            this.opened = true;
+        } catch (Throwable t) {
+            if (queries != null) {
+                queries.shutdownNow();
+            }
+            if (timeouts != null) {
+                timeouts.shutdownNow();
+            }
+            try {
+                ds.close();
+            } catch (Throwable closeError) {
+                LOG.warn("[dual-lookup] Doris open 失败后关闭半初始化连接池异常（已忽略）：{}",
+                        closeError.toString());
+            }
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw (Error) t;
+        }
         LOG.info("[dual-lookup] Doris reader opened, url={}, table={}, poolSize={}",
                 cfg.dorisJdbcUrl, cfg.dorisTableName, cfg.dorisPoolSize);
     }
@@ -208,20 +223,26 @@ public class DorisLookupReader implements LookupReader {
      * 先停调度器可避免「池已关闭但仍有人尝试调度超时任务」的无谓报错。
      */
     @Override
-    public void close() throws Exception {
-        if (timeoutScheduler != null) {
-            timeoutScheduler.shutdownNow();
-            timeoutScheduler = null;
-        }
-        if (queryExecutor != null) {
-            queryExecutor.shutdownNow();
-            queryExecutor = null;
-        }
-        if (dataSource != null) {
-            dataSource.close();
+    public synchronized void close() throws Exception {
+        try {
+            if (timeoutScheduler != null) {
+                timeoutScheduler.shutdownNow();
+                timeoutScheduler = null;
+            }
+            if (queryExecutor != null) {
+                queryExecutor.shutdownNow();
+                queryExecutor = null;
+            }
+            if (dataSource != null) {
+                dataSource.close();
+            }
+        } catch (Throwable t) {
+            // 清理路径不能因为单个资源关闭失败而跳过后续清理/让作业取消失败
+            LOG.warn("[dual-lookup] Doris 资源关闭异常（已忽略剩余清理）：{}", t.toString());
+        } finally {
             dataSource = null;
+            opened = false;
         }
-        opened = false;
     }
 
     // ---------------- 批量查询 ----------------
@@ -337,16 +358,26 @@ public class DorisLookupReader implements LookupReader {
                 result.completeExceptionally(
                         new IllegalStateException("[dual-lookup] DorisLookupReader is closed"));
             } else {
-                ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
-                    if (!result.isDone()) {
-                        result.completeExceptionally(
-                                new TimeoutException("Doris lookup timeout after " + cfg.timeoutMs + "ms"));
-                    }
-                }, cfg.timeoutMs, TimeUnit.MILLISECONDS);
-                // 查询提前结束时立即取消超时任务：否则它会一直留在调度器队列里直到到期。
-                // 高 QPS + 较大 timeout 时，单线程调度器里会堆积大量「结果早已返回」的任务，
-                // 到期逐个空转扫描，白白占用调度线程与内存
-                result.whenComplete((rows, ex) -> timeoutTask.cancel(false));
+                ScheduledFuture<?> timeoutTask = null;
+                try {
+                    timeoutTask = scheduler.schedule(() -> {
+                        if (!result.isDone()) {
+                            result.completeExceptionally(
+                                    new TimeoutException("Doris lookup timeout after " + cfg.timeoutMs + "ms"));
+                        }
+                    }, cfg.timeoutMs, TimeUnit.MILLISECONDS);
+                } catch (RejectedExecutionException e) {
+                    // close() 在 isShutdown() 检查之后、schedule() 之前关掉了调度器
+                    result.completeExceptionally(
+                            new IllegalStateException("[dual-lookup] DorisLookupReader is closed", e));
+                }
+                if (timeoutTask != null) {
+                    // 查询提前结束时立即取消超时任务：否则它会一直留在调度器队列里直到到期。
+                    // 高 QPS + 较大 timeout 时，单线程调度器里会堆积大量「结果早已返回」的任务，
+                    // 到期逐个空转扫描，白白占用调度线程与内存
+                    final ScheduledFuture<?> scheduled = timeoutTask;
+                    result.whenComplete((rows, ex) -> scheduled.cancel(false));
+                }
             }
         }
 

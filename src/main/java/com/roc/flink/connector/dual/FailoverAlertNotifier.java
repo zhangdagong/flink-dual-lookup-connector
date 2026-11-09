@@ -10,6 +10,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -46,7 +48,15 @@ final class FailoverAlertNotifier {
     private static final String PREFIX = "[dual-lookup] ";
 
     /** 关闭时给旁路的等待上限：告警不值得让作业取消多等 */
-    private static final long CLOSE_TIMEOUT_MS = 5_000L;
+    private static final long DEFAULT_CLOSE_TIMEOUT_MS = 5_000L;
+
+    /**
+     * JVM 内同表、同 topic 的最近一次降级告警时间。
+     *
+     * <p>告警计数本身是每子任务独立的，冷却窗放在静态表里可以让同一 TM 上的多个子任务
+     * 在窗口内只发一条；跨 TM 仍可能各发一条，完全去重需要下游按 table + 时间窗聚合。
+     */
+    private static final ConcurrentHashMap<String, Long> LAST_ALERT_AT = new ConcurrentHashMap<>();
 
     /**
      * 模板里允许出现的占位符白名单。
@@ -78,24 +88,64 @@ final class FailoverAlertNotifier {
     private final String subtaskLabel;
     /** 触发阈值（连续降级批数），必须 > 0 */
     private final int threshold;
-    /** JSON 模板（含 {@code ${xxx}} 占位符） */
+    /** 降级 JSON 模板（含 {@code ${xxx}} 占位符） */
     private final String template;
+    /** 恢复 JSON 模板（与降级模板使用同一套占位符） */
+    private final String recoveryTemplate;
     private final Sink sink;
+    /** 同表同 topic 的降级告警冷却毫秒数；0 = 不去重 */
+    private final long cooldownMs;
+    /** 冷却键：table + topic；为空时不做冷却 */
+    private final String cooldownKey;
+    /** 主源恢复后是否发 recovery */
+    private final boolean recoveryEnabled;
+    /** close 等待上限 */
+    private final long closeTimeoutMs;
+    private final AlertMetrics metrics;
 
     /** 当前连续降级批数；主源成功即归零 */
     private final AtomicInteger streak = new AtomicInteger();
     /** 本轮连续降级所波及的 key 数（用于回答「这次故障影响了多少条数据」） */
     private final AtomicLong streakKeys = new AtomicLong();
+    /** 本轮是否真正触发过降级告警；决定恢复时是否发 recovery */
+    private boolean alertActive;
+    /** close 幂等 */
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     FailoverAlertNotifier(String tableName, String primary, String standby, String subtaskLabel,
                           int threshold, String template, Sink sink) {
+        this(tableName, primary, standby, subtaskLabel, threshold, template, sink,
+                0L, "", false, DEFAULT_CLOSE_TIMEOUT_MS, AlertMetrics.NOOP);
+    }
+
+    FailoverAlertNotifier(String tableName, String primary, String standby, String subtaskLabel,
+                          int threshold, String template, Sink sink, long cooldownMs,
+                          String cooldownKey, boolean recoveryEnabled, long closeTimeoutMs,
+                          AlertMetrics metrics) {
+        this(tableName, primary, standby, subtaskLabel, threshold, template, sink, cooldownMs,
+                cooldownKey, recoveryEnabled, closeTimeoutMs, metrics,
+                DualLookupOptions.DEFAULT_ALERT_RECOVERY_MESSAGE);
+    }
+
+    FailoverAlertNotifier(String tableName, String primary, String standby, String subtaskLabel,
+                          int threshold, String template, Sink sink, long cooldownMs,
+                          String cooldownKey, boolean recoveryEnabled, long closeTimeoutMs,
+                          AlertMetrics metrics, String recoveryTemplate) {
         this.tableName = tableName;
         this.primary = primary;
         this.standby = standby;
         this.subtaskLabel = subtaskLabel == null ? "" : subtaskLabel;
         this.threshold = threshold;
-        this.template = template;
+        this.template = template == null || template.trim().isEmpty()
+                ? DualLookupOptions.DEFAULT_ALERT_MESSAGE : template;
+        this.recoveryTemplate = recoveryTemplate == null || recoveryTemplate.trim().isEmpty()
+                ? DualLookupOptions.DEFAULT_ALERT_RECOVERY_MESSAGE : recoveryTemplate;
         this.sink = sink;
+        this.cooldownMs = Math.max(0L, cooldownMs);
+        this.cooldownKey = cooldownKey == null ? "" : cooldownKey;
+        this.recoveryEnabled = recoveryEnabled;
+        this.closeTimeoutMs = Math.max(1L, closeTimeoutMs);
+        this.metrics = metrics == null ? AlertMetrics.NOOP : metrics;
     }
 
     /**
@@ -105,12 +155,37 @@ final class FailoverAlertNotifier {
      * 既不建线程也不建 Kafka 生产者——关闭告警的用户不该为它承担任何开销。
      */
     static FailoverAlertNotifier create(DualLookupOptions.Config cfg, String tableName, String subtaskLabel) {
+        return create(cfg, tableName, subtaskLabel, AlertMetrics.NOOP);
+    }
+
+    static FailoverAlertNotifier create(DualLookupOptions.Config cfg, String tableName, String subtaskLabel,
+                                        AlertMetrics metrics) {
         if (cfg.alertThreshold <= 0) {
             return null;
         }
-        return new FailoverAlertNotifier(tableName, cfg.primary, cfg.standby, subtaskLabel,
-                cfg.alertThreshold, cfg.alertKafkaMessage,
-                new KafkaAlertSink(cfg.alertKafkaBootstrap, cfg.alertKafkaTopic, cfg.alertKafkaAcks));
+        try {
+            String clientId = cfg.alertKafkaClientId == null || cfg.alertKafkaClientId.trim().isEmpty()
+                    ? buildClientId(tableName, subtaskLabel) : cfg.alertKafkaClientId.trim();
+            String cooldownKey = tableName + "\u0000" + cfg.alertKafkaTopic;
+            return new FailoverAlertNotifier(tableName, cfg.primary, cfg.standby, subtaskLabel,
+                    cfg.alertThreshold, cfg.alertKafkaMessage,
+                    new KafkaAlertSink(cfg, clientId, metrics),
+                    cfg.alertCooldownMinutes * 60_000L, cooldownKey, cfg.alertRecovery,
+                    cfg.alertKafkaCloseTimeoutMs, metrics, cfg.alertKafkaRecoveryMessage);
+        } catch (Throwable t) {
+            // 告警装配失败（Kafka 类缺失、线程池/对象创建失败等）不能影响算子启动
+            LOG.warn(PREFIX + "表={} 连续降级告警初始化失败（已禁用告警，不影响维表查询）：{}",
+                    tableName, t.toString());
+            return null;
+        }
+    }
+
+    /** Kafka client.id 带 table/subtask，避免多子任务在 Kafka 日志与指标里混在一起 */
+    private static String buildClientId(String tableName, String subtaskLabel) {
+        String raw = "dual-lookup-alert-" + tableName
+                + (subtaskLabel == null || subtaskLabel.isEmpty() ? "" : "-" + subtaskLabel);
+        String safe = raw.replaceAll("[^A-Za-z0-9._-]", "_");
+        return safe.length() <= 180 ? safe : safe.substring(0, 180);
     }
 
     /**
@@ -119,13 +194,24 @@ final class FailoverAlertNotifier {
      * @param keys  本批 key 数（累加进「本轮影响面」，让告警能说明影响多少条数据）
      * @param cause 主源失败原因（已剥掉 CompletableFuture 包装）
      */
-    void onFailover(int keys, Throwable cause) {
+    synchronized void onFailover(int keys, Throwable cause) {
+        if (closed.get()) {
+            return;
+        }
         // 先累加 key 数再自增批次：反过来的话，读到「恰好等于阈值」的线程可能还没看到本批的 key
         long affectedKeys = streakKeys.addAndGet(Math.max(0, keys));
         int consecutive = streak.incrementAndGet();
         if (consecutive != threshold) {
             return; // 未到阈值，或已经越过（本次故障已推过），都不重复推送
         }
+        metrics.triggered();
+        if (!acquireCooldown()) {
+            metrics.suppressed();
+            LOG.info(PREFIX + "表={} 连续 {} 批降级，但距上次告警不足冷却窗口（{} 分钟），本次不重复推送",
+                    tableName, consecutive, cooldownMs / 60_000L);
+            return;
+        }
+        alertActive = true;
         try {
             fire(consecutive, affectedKeys, cause);
         } catch (Throwable t) {
@@ -134,12 +220,44 @@ final class FailoverAlertNotifier {
         }
     }
 
-    /** 主源恢复成功：故障周期结束，重新武装。热路径上通常只付一次 volatile 读。 */
-    void onPrimarySuccess() {
+    /** 主源恢复成功：故障周期结束，重新武装；若本轮真正告警过，再推一条 recovery。 */
+    synchronized void onPrimarySuccess() {
+        if (closed.get()) {
+            return;
+        }
+        boolean wasActive = alertActive;
+        alertActive = false;
         if (streak.get() != 0) {
             streak.set(0);
             streakKeys.set(0);
         }
+        if (wasActive && recoveryEnabled) {
+            try {
+                fireRecovery();
+            } catch (Throwable t) {
+                LOG.warn(PREFIX + "表={} 恢复告警推送失败（不影响维表查询）：{}", tableName, t.toString());
+            }
+        }
+    }
+
+    /**
+     * 同表同 topic 的告警冷却。用 compute 保证同一 JVM 内多个子任务并发时只有一个能拿到窗口；
+     * 跨 TM 的重复仍需下游按 table + 时间窗去重。
+     */
+    private boolean acquireCooldown() {
+        if (cooldownMs <= 0L || cooldownKey.isEmpty()) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        AtomicBoolean allowed = new AtomicBoolean(false);
+        LAST_ALERT_AT.compute(cooldownKey, (key, previous) -> {
+            if (previous != null && now - previous < cooldownMs) {
+                return previous;
+            }
+            allowed.set(true);
+            return now;
+        });
+        return allowed.get();
     }
 
     /** 当前连续降级批数（测试与诊断用） */
@@ -147,10 +265,18 @@ final class FailoverAlertNotifier {
         return streak.get();
     }
 
-    /** 关闭旁路；不抛异常，避免影响算子的正常关闭流程 */
+    /** 仅供测试清理 JVM 级冷却表，避免用例之间或机器时钟抖动造成偶发失败 */
+    static void clearCooldownForTests() {
+        LAST_ALERT_AT.clear();
+    }
+
+    /** 关闭旁路；幂等，不抛异常，避免影响算子的正常关闭流程 */
     void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         try {
-            sink.close(CLOSE_TIMEOUT_MS);
+            sink.close(closeTimeoutMs);
         } catch (Throwable t) {
             LOG.warn(PREFIX + "表={} 告警通道关闭异常（已忽略）：{}", tableName, t.toString());
         }
@@ -160,10 +286,21 @@ final class FailoverAlertNotifier {
         Alert alert = new Alert(tableName, primary, standby, subtaskLabel, threshold,
                 consecutive, affectedKeys, reasonOf(cause), System.currentTimeMillis());
         sink.send(render(template, alert));
-        // 这条 WARN 是「消息是否真的推出去」的日志侧锚点：Kafka 侧的投递结果由 Sink 自己记录，
-        // 两边时间戳对上，才能区分「没触发」和「触发了但没送达」
-        LOG.warn(PREFIX + "表={} 已连续 {} 批降级至备源 {}（波及 {} 个 key），已推送告警",
+        // 这里只表示「已提交给旁路」；真正的 Kafka 投递结果由 KafkaAlertSink 的异步日志给出。
+        // 不能写「已推送」——send() 只入队，队列满/生产者创建失败时消息可能还没发出去。
+        LOG.warn(PREFIX + "表={} 已连续 {} 批降级至备源 {}（波及 {} 个 key），已触发告警投递（结果见后续 Kafka 日志）",
                 tableName, consecutive, standby, affectedKeys);
+    }
+
+    /** 恢复消息使用独立的 recovery 模板，避免把降级模板误当成恢复消息渲染 */
+    private void fireRecovery() {
+        long timestamp = System.currentTimeMillis();
+        Alert alert = new Alert(tableName, primary, standby, subtaskLabel, threshold,
+                0, 0L, "primary recovered", timestamp);
+        sink.send(render(recoveryTemplate, alert));
+        metrics.recovery();
+        LOG.info(PREFIX + "表={} 主源 {} 已恢复，已触发恢复告警投递（结果见后续 Kafka 日志）",
+                tableName, primary);
     }
 
     /** 失败原因的可读描述：类名 + 消息；消息为空时只留类名（避免出现 "null" 尾巴） */

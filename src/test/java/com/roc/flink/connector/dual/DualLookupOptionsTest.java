@@ -62,6 +62,30 @@ public class DualLookupOptionsTest {
         assertEquals(360, cfg.statsLogIntervalSec);          // 统计日志默认 6 分钟一条
         assertEquals("simple", cfg.hbaseSecurityAuthentication);
         assertEquals("authentication", cfg.hbaseRpcProtection);
+        assertEquals(3, cfg.alertCooldownMinutes);
+        assertTrue(cfg.alertRecovery);
+        assertEquals(2, cfg.alertRetryMax);
+        assertEquals(500, cfg.alertRetryBackoffMs);
+        assertEquals(5000, cfg.alertRetryBackoffMaxMs);
+        assertEquals(8, cfg.alertKafkaQueueCapacity);
+        assertEquals(5000, cfg.alertKafkaMaxBlockMs);
+        assertEquals(5000, cfg.alertKafkaRequestTimeoutMs);
+        assertEquals(15000, cfg.alertKafkaDeliveryTimeoutMs);
+        assertEquals(2, cfg.alertKafkaRetries);
+        assertEquals(5000, cfg.alertKafkaCloseTimeoutMs);
+        assertTrue(cfg.alertKafkaProperties.isEmpty());
+        assertEquals(DualLookupOptions.DEFAULT_ALERT_RECOVERY_MESSAGE, cfg.alertKafkaRecoveryMessage);
+    }
+
+    @Test
+    public void alertKafkaPropertiesArePassedThrough() {
+        Map<String, String> kafkaProps = new HashMap<>();
+        kafkaProps.put("security.protocol", "SASL_PLAINTEXT");
+        kafkaProps.put("sasl.mechanism", "GSSAPI");
+        DualLookupOptions.Config cfg = DualLookupOptions.Config.from(
+                base(), "dim_account", new HashMap<String, String>(), null, kafkaProps);
+        assertEquals("SASL_PLAINTEXT", cfg.alertKafkaProperties.get("security.protocol"));
+        assertEquals("GSSAPI", cfg.alertKafkaProperties.get("sasl.mechanism"));
     }
 
     @Test

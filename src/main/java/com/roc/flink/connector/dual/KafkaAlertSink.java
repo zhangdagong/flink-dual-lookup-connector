@@ -7,7 +7,14 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
@@ -19,71 +26,104 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 把告警 JSON 投递到 Kafka 的旁路实现。
  *
- * <p><b>三条不可妥协的约束</b>（都源于「告警不能影响主链路」）：
+ * <p><b>四条不可妥协的约束</b>（都源于「告警不能影响主链路」）：
  * <ol>
  *   <li><b>调用线程绝不做网络 IO</b>。{@code KafkaProducer.send()} 在元数据不可用时会阻塞
- *       {@code max.block.ms}（默认 60 秒！）——若在降级回调线程里直接调用，HBase 故障叠加
- *       Kafka 不可达就会把维表查询整条链路拖死。因此 {@link #send} 只负责入队，真正的发送
- *       在独立守护线程上执行。</li>
- *   <li><b>生产者惰性创建</b>。构造 {@code KafkaProducer} 会拉起 sender 线程并做元数据初始化；
- *       没触发过告警的作业不该为此付出任何代价，所以推迟到第一次真正要发消息时再建。</li>
+ *       {@code max.block.ms}；若在降级回调线程里直接调用，HBase 故障叠加 Kafka 不可达就会把
+ *       维表查询整条链路拖死。因此 {@link #send} 只负责入队，真正的发送在独立守护线程上执行。</li>
+ *   <li><b>生产者惰性创建</b>。没触发过告警的作业不该为此付出任何代价。</li>
  *   <li><b>队列有界、满了就丢</b>。Kafka 长时间不可用而故障持续时，宁可丢告警也不能让内存
- *       或线程堆积；丢弃会打一条 WARN 并计数，丢了多少是可查的。</li>
+ *       或线程堆积；队列满时只 WARN/计数，最终投递失败才尽量写入本地死信。</li>
+ *   <li><b>失败只记录，不冒泡</b>。任何网络/认证/topic/序列化异常都只影响告警。</li>
  * </ol>
- *
- * <p>其余取舍：
- * <ul>
- *   <li>{@code acks} 默认 1（leader 落盘即返回）：告警不需要金融级的持久性，却要求尽快发出；</li>
- *   <li>显式 {@code enable.idempotence=false}：幂等要求 {@code acks=all}，与 acks=1 冲突会直接
- *       让生产者构造失败（kafka-clients 3.x 默认开启幂等）；</li>
- *   <li>显式 {@code compression.type=none}：因此可以在打包时排除 zstd/lz4/snappy 三个压缩库，
- *       省下约 8MB——这是本连接器唯一能压缩 jar 体积的地方（见 pom 注释）。</li>
- * </ul>
  */
 final class KafkaAlertSink implements FailoverAlertNotifier.Sink {
 
     private static final Logger LOG = LoggerFactory.getLogger(KafkaAlertSink.class);
 
     private static final String PREFIX = "[dual-lookup] ";
-
-    /** 待发告警的队列容量：告警是低频事件，能堆 8 条说明 Kafka 已经不可达了 */
-    private static final int QUEUE_CAPACITY = 8;
-    /** 等元数据的上限；只在告警线程上阻塞，不能设太长以免故障恢复后队列迟迟排不空 */
-    private static final int MAX_BLOCK_MS = 5_000;
-    /** 单条消息的整体投递上限（必须 >= request.timeout.ms） */
-    private static final int DELIVERY_TIMEOUT_MS = 15_000;
+    private static final int DEFAULT_QUEUE_CAPACITY = 8;
+    private static final int DEFAULT_MAX_BLOCK_MS = 5_000;
+    private static final int DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+    private static final int DEFAULT_DELIVERY_TIMEOUT_MS = 15_000;
+    private static final int DEFAULT_PRODUCER_RETRIES = 2;
+    private static final String DEFAULT_CLIENT_ID = "dual-lookup-alert";
 
     private final String bootstrapServers;
     private final String topic;
     private final String acks;
+    private final String clientId;
+    private final Map<String, String> extraProperties;
+    private final int maxBlockMs;
+    private final int requestTimeoutMs;
+    private final int deliveryTimeoutMs;
+    private final int producerRetries;
+    private final int retryMax;
+    private final int retryBackoffMs;
+    private final int retryBackoffMaxMs;
+    private final String spoolDir;
+    private final long spoolMaxBytes;
+    private final AlertMetrics metrics;
 
     private final ExecutorService executor;
     /** 惰性创建的生产者；volatile 供无锁快路径读取 */
     private volatile KafkaProducer<String, String> producer;
-    /** 创建失败只报一次，避免每次告警都刷同一条 ERROR */
-    private final AtomicBoolean createFailureReported = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
-    /** 因队列满被丢弃的告警条数（只在首次丢弃时告警） */
+    /** 因队列满/最终失败被丢弃的告警条数 */
     private final AtomicInteger dropped = new AtomicInteger();
 
+    /** 测试与默认路径：所有可调参数取默认值 */
     KafkaAlertSink(String bootstrapServers, String topic, String acks) {
+        this(bootstrapServers, topic, acks, DEFAULT_CLIENT_ID, Collections.<String, String>emptyMap(),
+                DEFAULT_QUEUE_CAPACITY, DEFAULT_MAX_BLOCK_MS, DEFAULT_REQUEST_TIMEOUT_MS,
+                DEFAULT_DELIVERY_TIMEOUT_MS, DEFAULT_PRODUCER_RETRIES, 0, 0, 0,
+                "", 0L, AlertMetrics.NOOP);
+    }
+
+    /** 生产路径：从已校验的 DDL 配置装配 */
+    KafkaAlertSink(DualLookupOptions.Config cfg, String clientId, AlertMetrics metrics) {
+        this(cfg.alertKafkaBootstrap, cfg.alertKafkaTopic, cfg.alertKafkaAcks, clientId,
+                cfg.alertKafkaProperties, cfg.alertKafkaQueueCapacity, cfg.alertKafkaMaxBlockMs,
+                cfg.alertKafkaRequestTimeoutMs, cfg.alertKafkaDeliveryTimeoutMs,
+                cfg.alertKafkaRetries, cfg.alertRetryMax, cfg.alertRetryBackoffMs,
+                cfg.alertRetryBackoffMaxMs, cfg.alertSpoolDir, cfg.alertSpoolMaxBytes, metrics);
+    }
+
+    private KafkaAlertSink(String bootstrapServers, String topic, String acks, String clientId,
+                           Map<String, String> extraProperties, int queueCapacity, int maxBlockMs,
+                           int requestTimeoutMs, int deliveryTimeoutMs, int producerRetries,
+                           int retryMax, int retryBackoffMs, int retryBackoffMaxMs,
+                           String spoolDir, long spoolMaxBytes, AlertMetrics metrics) {
         this.bootstrapServers = bootstrapServers;
         this.topic = topic;
         this.acks = acks;
+        this.clientId = clientId == null || clientId.trim().isEmpty() ? DEFAULT_CLIENT_ID : clientId;
+        this.extraProperties = extraProperties == null
+                ? Collections.<String, String>emptyMap() : extraProperties;
+        this.maxBlockMs = maxBlockMs;
+        this.requestTimeoutMs = requestTimeoutMs;
+        this.deliveryTimeoutMs = deliveryTimeoutMs;
+        this.producerRetries = producerRetries;
+        this.retryMax = retryMax;
+        this.retryBackoffMs = retryBackoffMs;
+        this.retryBackoffMaxMs = retryBackoffMaxMs;
+        this.spoolDir = spoolDir == null ? "" : spoolDir.trim();
+        this.spoolMaxBytes = spoolMaxBytes;
+        this.metrics = metrics == null ? AlertMetrics.NOOP : metrics;
         // 单线程 + 有界队列：保证告警按触发顺序发出，且积压量有上限
         this.executor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<Runnable>(QUEUE_CAPACITY),
+                new ArrayBlockingQueue<Runnable>(Math.max(1, queueCapacity)),
                 r -> {
                     Thread t = new Thread(r, "dual-lookup-alert");
                     t.setDaemon(true);
                     return t;
                 },
                 (r, pool) -> {
-                    // 不做 CallerRuns：那会让入队线程（降级回调）去发 Kafka，正好违反约束 1
-                    if (dropped.incrementAndGet() == 1) {
-                        LOG.warn(PREFIX + "告警队列已满（Kafka 不可达或极慢），本次告警被丢弃；"
-                                + "丢一条告警不影响维表查询，恢复后统计日志里的降级计数仍然准确");
-                    }
+                    // 不做 CallerRuns：那会让入队线程（降级回调）去发 Kafka，正好违反约束 1。
+                    // 这里也不再同步写死信：磁盘 IO 同样可能在故障现场拖慢降级回调。
+                    int total = dropped.incrementAndGet();
+                    KafkaAlertSink.this.metrics.dropped();
+                    LOG.warn(PREFIX + "告警队列已满，本次告警被丢弃（累计丢弃 {} 条）；不影响维表查询", total);
                 });
     }
 
@@ -95,29 +135,101 @@ final class KafkaAlertSink implements FailoverAlertNotifier.Sink {
         try {
             executor.execute(() -> deliver(payload));
         } catch (Throwable t) {
-            // 线程池已关闭等极端情况：吞掉，绝不让告警把降级链路带崩
+            // 线程池已关闭等极端情况：只记录原因，绝不让告警把降级链路带崩
+            metrics.failed();
+            LOG.warn(PREFIX + "告警入队失败（不影响维表查询）：{}", t.toString());
+            spool(payload, "入队失败: " + t);
         }
     }
 
     private void deliver(String payload) {
-        try {
-            KafkaProducer<String, String> p = producer();
-            if (p == null) {
+        Throwable last = null;
+        int attempts = Math.max(0, retryMax) + 1;
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            if (closed.get()) {
                 return;
             }
-            p.send(new ProducerRecord<>(topic, payload), (metadata, error) -> {
-                if (error != null) {
-                    LOG.warn(PREFIX + "告警投递失败（topic={}）：{}", topic, error.toString());
-                } else if (LOG.isDebugEnabled()) {
-                    // 成功路径放到 DEBUG：告警本身低频，但 Kafka 客户端在 INFO 下已经够吵
-                    LOG.debug(PREFIX + "告警已投递 topic={} partition={} offset={}",
-                            topic, metadata.partition(), metadata.offset());
+            if (attempt > 0) {
+                metrics.retry();
+                if (!sleepBackoff(attempt)) {
+                    spool(payload, "重试被中断");
+                    return;
                 }
-            });
-        } catch (Throwable t) {
-            if (createFailureReported.compareAndSet(false, true)) {
-                LOG.warn(PREFIX + "告警生产者不可用，后续告警将静默跳过（不影响维表查询）：{}", t.toString());
             }
+            KafkaProducer<String, String> p;
+            try {
+                p = producer();
+            } catch (Throwable t) {
+                last = t;
+                metrics.failed();
+                LOG.warn(PREFIX + "告警生产者创建失败（topic={}，第 {}/{} 次，不影响维表查询）：{}",
+                        topic, attempt + 1, attempts, t.toString());
+                continue;
+            }
+            try {
+                // 在独立告警线程上同步等待 Future：这样才能对「投递失败」做有界重试和死信，
+                // 同时不会阻塞降级回调线程。
+                p.send(new ProducerRecord<>(topic, payload)).get(deliveryTimeoutMs, TimeUnit.MILLISECONDS);
+                metrics.sent();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(PREFIX + "告警已投递 topic={}", topic);
+                }
+                return;
+            } catch (Throwable t) {
+                last = t;
+                metrics.failed();
+                LOG.warn(PREFIX + "告警投递失败（topic={}，第 {}/{} 次，不影响维表查询）：{}",
+                        topic, attempt + 1, attempts, t.toString());
+            }
+        }
+        spool(payload, last == null ? "未知错误" : last.toString());
+    }
+
+    private boolean sleepBackoff(int attempt) {
+        long delay = retryBackoffMs;
+        for (int i = 1; i < attempt && delay < retryBackoffMaxMs; i++) {
+            delay = Math.min((long) retryBackoffMaxMs, delay * 2L);
+        }
+        delay = Math.min(delay, retryBackoffMaxMs);
+        try {
+            Thread.sleep(Math.max(0L, delay));
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** 最终失败后的本地死信：有界、尽力而为，任何 IO 异常都不能冒泡 */
+    synchronized void spool(String payload, String reason) {
+        if (spoolDir.isEmpty()) {
+            metrics.dropped();
+            return;
+        }
+        try {
+            Path dir = Paths.get(spoolDir);
+            Files.createDirectories(dir);
+            String safe = clientId.replaceAll("[^A-Za-z0-9._-]", "_");
+            if (safe.length() > 120) {
+                safe = safe.substring(0, 120);
+            }
+            Path file = dir.resolve(safe + ".jsonl");
+            if (Files.exists(file) && Files.size(file) >= spoolMaxBytes) {
+                metrics.dropped();
+                LOG.warn(PREFIX + "告警死信文件已达到上限 {} 字节，丢弃本条：{}", spoolMaxBytes, file);
+                return;
+            }
+            String line = "{\"timestamp\":" + System.currentTimeMillis()
+                    + ",\"clientId\":\"" + FailoverAlertNotifier.escapeJson(clientId)
+                    + "\",\"error\":\"" + FailoverAlertNotifier.escapeJson(reason)
+                    + "\",\"payload\":" + payload + "}\n";
+            Files.write(file, line.getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            metrics.spooled();
+            LOG.warn(PREFIX + "告警已写入本地死信 {}（原因：{}）", file, reason);
+        } catch (Throwable t) {
+            metrics.dropped();
+            LOG.warn(PREFIX + "告警本地死信写入失败（不影响维表查询）：{}", t.toString());
         }
     }
 
@@ -129,17 +241,23 @@ final class KafkaAlertSink implements FailoverAlertNotifier.Sink {
         }
         synchronized (this) {
             if (producer == null) {
-                producer = new KafkaProducer<>(producerProps(bootstrapServers, acks));
+                producer = new KafkaProducer<>(producerProps(bootstrapServers, acks, clientId,
+                        extraProperties, maxBlockMs, requestTimeoutMs, deliveryTimeoutMs, producerRetries));
             }
             return producer;
         }
     }
 
-    /**
-     * 生产者参数。抽成静态方法是为了让单元测试能拿「真实参数」去构造一个 Producer：
-     * 这样配置是否合法、以及「排除压缩库后类还能不能加载」都能在没有 broker 的环境里验证。
-     */
+    /** 测试与默认路径：只给 bootstrap/acks */
     static Properties producerProps(String bootstrapServers, String acks) {
+        return producerProps(bootstrapServers, acks, DEFAULT_CLIENT_ID,
+                Collections.<String, String>emptyMap(), DEFAULT_MAX_BLOCK_MS, DEFAULT_REQUEST_TIMEOUT_MS,
+                DEFAULT_DELIVERY_TIMEOUT_MS, DEFAULT_PRODUCER_RETRIES);
+    }
+
+    static Properties producerProps(String bootstrapServers, String acks, String clientId,
+                                    Map<String, String> extraProperties, int maxBlockMs,
+                                    int requestTimeoutMs, int deliveryTimeoutMs, int producerRetries) {
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
@@ -149,22 +267,28 @@ final class KafkaAlertSink implements FailoverAlertNotifier.Sink {
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "false");
         // 必须与「打包时排除压缩库」保持一致：改成别的压缩算法会在运行期 NoClassDefFoundError
         props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");
-        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, MAX_BLOCK_MS);
-        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, DELIVERY_TIMEOUT_MS);
-        // 告警允许少量重试；重试太多会让一条过期告警在故障恢复后才到达，反而误导
-        props.put(ProducerConfig.RETRIES_CONFIG, 2);
-        props.put(ProducerConfig.CLIENT_ID_CONFIG, "dual-lookup-alert");
+        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, maxBlockMs);
+        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, requestTimeoutMs);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, deliveryTimeoutMs);
+        props.put(ProducerConfig.RETRIES_CONFIG, producerRetries);
+        props.put(ProducerConfig.CLIENT_ID_CONFIG,
+                clientId == null || clientId.trim().isEmpty() ? DEFAULT_CLIENT_ID : clientId);
+        // 用户透传项最后写入，允许覆盖默认值（如 security.protocol/sasl.*/ssl.*）
+        if (extraProperties != null) {
+            for (Map.Entry<String, String> entry : extraProperties.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null) {
+                    props.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
         return props;
     }
 
     /**
      * 尽力冲刷并关闭。重复调用安全（作业关闭可能被触发两次）。
      *
-     * <p>顺序是「先停队列、再关生产者」：{@code shutdown()} 让已入队的消息有机会跑完，
-     * 然后由 {@code close(Duration)} 冲刷在途消息——<b>不要额外调用 {@code flush()}</b>：
-     * 它没有超时上限（最坏等到 {@code delivery.timeout.ms=15s}），会让「关闭有上限」的承诺失效。
-     * 整个过程受 {@code timeoutMs} 约束——告警不值得让作业取消多等。
+     * <p>顺序是「先停队列、再关生产者」；整个过程受 {@code timeoutMs} 约束，
+     * 告警不值得让作业取消多等。
      */
     @Override
     public void close(long timeoutMs) {
@@ -179,15 +303,18 @@ final class KafkaAlertSink implements FailoverAlertNotifier.Sink {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             executor.shutdownNow();
+        } catch (Throwable t) {
+            LOG.warn(PREFIX + "告警队列关闭异常（已忽略，不影响维表查询）：{}", t.toString());
         }
         KafkaProducer<String, String> p = producer;
         if (p == null) {
             return; // 从未触发过告警：不创建生产者，也就没有资源要释放
         }
         try {
-            p.close(Duration.ofMillis(timeoutMs));
+            p.close(Duration.ofMillis(Math.max(1L, timeoutMs)));
         } catch (Throwable t) {
-            LOG.debug(PREFIX + "告警生产者关闭异常（已忽略）：{}", t.toString());
+            LOG.warn(PREFIX + "告警生产者关闭异常（已忽略，不影响维表查询）：{}", t.toString());
         }
     }
+
 }

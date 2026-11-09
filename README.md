@@ -25,34 +25,34 @@ asyncLookup(key) ─► 攒批缓冲 ─(满 50 条 / 等 5ms)─► 主源 HBas
 | HBase | **2.2.7** | `hbase-shaded-client-**byo-hadoop**`，原生异步客户端 |
 | Hadoop | **3.1.3** | 集群提供；`hadoop-common`/`hadoop-auth` 仅 `provided`，**不打进 jar** |
 | Doris | 4.0.8 | MySQL 协议（JDBC + HikariCP），2.x/3.x 也适用 |
-| Kafka | 3.x（客户端已内置） | **仅告警旁路用**，不参与数据读取 |
-| 构建 | Maven 3.6+ | shade 打 fat jar（约 34MB） |
+| Kafka | 3.x（客户端由集群提供） | **仅告警旁路用**，不参与数据读取；`kafka-clients` 为 `provided`，避免与集群版本重复 |
+| 构建 | Maven 3.6+ | shade 打 fat jar（约 29MB） |
 
 硬约束：
 
 - **HBase 与 Hadoop 必须成对**：用 `hbase-shaded-client-byo-hadoop`，带 Hadoop 的版本会引发 `NoSuchMethodError: ... FsTracer.get(...)Lorg/apache/htrace/core/Tracer;`（jar 内置 Hadoop 3.4.1，集群 3.1.3，返回类型不同）。`htrace-core4` 同理不打进 jar，hadoop-free 部署需手动补进 `lib/`。
 - **HikariCP 4.0.3**：兼容 Java 8 的最后一代（5.x 需 Java 11+）。
-- **Kafka 客户端（v1.3+）**：只服务告警旁路（10.1），`lookup.alert.threshold=0`（默认）时不创建任何 Kafka 对象。打包排除了 `zstd-jni`/`lz4-java`/`snappy-java`（省约 8MB），前提是生产者固定 `compression.type=none`——**要开压缩必须同改 pom 与 `KafkaAlertSink`**。集群已有 `flink-connector-kafka` 带来的 kafka-clients 会重复但 child-first 不影响功能，介意可改 `provided`。
+- **Kafka 客户端（v1.4+）**：只服务告警旁路（10.1），`lookup.alert.threshold=0`（默认）时不创建任何 Kafka 对象。`kafka-clients` 改为 **`provided`**，由集群的 `flink-connector-kafka` 统一提供，避免 fat jar 与集群出现两份不同版本的客户端。若集群没有 kafka-clients，告警初始化会打 WARN 并禁用告警，但作业继续运行。打包仍排除 `zstd-jni`/`lz4-java`/`snappy-java`，默认 `compression.type=none`。
 
 核对集群 Hadoop 世代：`javap -classpath $FLINK_HOME/lib/hadoop-common-*.jar org.apache.hadoop.fs.FsTracer`。3.1.3 返回 `org.apache.htrace.core.Tracer`，3.4+ 是 `org.apache.hadoop.tracing.Tracer`——两者不能混用。
 
 ## 3. 构建与部署
 
 ```bash
-mvn test                          # 116 个用例，不依赖任何外部服务
+mvn test                          # 127 个用例；真实 Kafka 集成测试默认跳过
 mvn clean package
 
 # 产物体检：有输出就说明 jar 混入了本应由集群提供的类
-jar tf target/flink-dual-lookup-connector-1.3.0.jar \
-  | grep -E 'org/apache/hadoop/(fs|conf|security)/|org/apache/htrace/' \
+jar tf target/flink-dual-lookup-connector-1.4.0.jar \
+  | grep -E 'org/apache/hadoop/(fs|conf|security)/|org/apache/htrace/|org/apache/kafka/' \
   && echo '✗ jar 被污染' || echo '✓ jar 干净'
 
 rm $FLINK_HOME/lib/flink-dual-lookup-connector-1.*.jar    # 旧包必须删，JM 与所有 TM
-cp target/flink-dual-lookup-connector-1.3.0.jar $FLINK_HOME/lib/
+cp target/flink-dual-lookup-connector-1.4.0.jar $FLINK_HOME/lib/
 $FLINK_HOME/bin/stop-cluster.sh && $FLINK_HOME/bin/start-cluster.sh
 ```
 
-> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里。1.3.0 约 **34MB**（1.2.x 为 29MB，多出 Kafka 客户端；更早带 Hadoop 的版本 65MB）。升级前看第 15 章。
+> 只允许 `org/apache/hadoop/hbase/**` 出现在 jar 里。1.4.x 约 **29MB**（Kafka 客户端改为集群提供；更早带 Hadoop 的版本 65MB）。升级前看第 15 章。
 
 ## 4. 最小示例
 
@@ -232,10 +232,23 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `lookup.alert.threshold` | `0` | 连续降级批数阈值；`0` = 关闭（不建线程、不建生产者） |
 | `lookup.alert.kafka.bootstrap-servers` | — | 阈值 > 0 时**必填** |
 | `lookup.alert.kafka.topic` | — | 阈值 > 0 时**必填** |
-| `lookup.alert.kafka.message` | 内置 JSON | 消息模板，占位符见 10.1；建表期校验 |
+| `lookup.alert.kafka.message` | 内置 JSON | 降级消息模板，占位符见 10.1；建表期校验 |
+| `lookup.alert.recovery.message` | 内置 JSON | 恢复消息模板，支持同一套占位符；建表期校验 |
 | `lookup.alert.kafka.acks` | `1` | `0` / `1` / `all`；生产者已关幂等，不与 acks 冲突 |
+| `lookup.alert.cooldown` | `3` | 同表同 topic 在 N 分钟内不重复降级告警；0 = 不去重 |
+| `lookup.alert.recovery` | `true` | 主源恢复后是否按 `lookup.alert.recovery.message` 推送 |
+| `lookup.alert.retry.max` | `2` | 应用层重试次数（不含首次） |
+| `lookup.alert.retry.backoff-ms` / `backoff-max-ms` | `500` / `5000` | 指数退避与上限 |
+| `lookup.alert.spool.dir` | 空 | 最终失败后的本地 JSONL 死信目录；空 = 不落盘 |
+| `lookup.alert.spool.max-bytes` | `10485760` | 单个死信文件上限，超过后丢弃并 WARN |
+| `lookup.alert.kafka.client-id` | 自动 | 默认 `dual-lookup-alert-<table>-<subtask>` |
+| `lookup.alert.kafka.queue-capacity` | `8` | 有界告警队列 |
+| `lookup.alert.kafka.max-block-ms` / `request-timeout-ms` / `delivery-timeout-ms` | `5000` / `5000` / `15000` | Kafka 客户端超时；只在告警线程生效 |
+| `lookup.alert.kafka.retries` | `2` | KafkaProducer 内部重试次数 |
+| `lookup.alert.kafka.close-timeout-ms` | `5000` | 作业关闭时等待告警冲刷的上限 |
+| `lookup.alert.kafka.properties.*` | — | 透传 SASL/GSSAPI/SSL/JAAS 等 Kafka 客户端参数，例如 `security.protocol`、`sasl.mechanism`、`sasl.jaas.config`、`ssl.truststore.location` |
 
-语义与注意事项见 **10.1**。三条建表期校验：阈值为负报错；启用但缺 bootstrap/topic 报错；模板非 JSON 或含未知占位符报错。
+语义与注意事项见 **10.1**。建表期校验：阈值为负、缺少 bootstrap/topic、`acks` 非法、模板非法、重试/队列/超时参数非法都会直接报错。
 
 ## 8. 内置元字段
 
@@ -299,8 +312,19 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 'lookup.alert.threshold'               = '10',
 'lookup.alert.kafka.bootstrap-servers' = 'localhost:9092',
 'lookup.alert.kafka.topic'             = 'dual_lookup_alert',
+'lookup.alert.cooldown'                = '3',          -- 同表同 topic 3 分钟内不重复降级告警
+'lookup.alert.recovery'                = 'true',       -- 主源恢复后推 recovery
+'lookup.alert.retry.max'               = '2',
+'lookup.alert.spool.dir'               = '/data/flink/alert-deadletter',
 -- 可选，不写就用内置模板；SQL 里用单引号包整个模板，内部一律双引号
-'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},"keys":${affectedKeys},"reason":"${reason}"}'
+'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},"keys":${affectedKeys},"reason":"${reason}"}',
+-- 恢复消息也支持自定义 JSON（占位符同降级消息；可用 ${affectedKeys} 等，恢复时数值为 0）
+'lookup.alert.recovery.message' = '{"level":"INFO","event":"recovered","table":"${table}","subtask":"${subtask}"}',
+-- SASL/GSSAPI/SSL/JAAS 等参数原样透传（键名就是 Kafka 客户端键名）
+'lookup.alert.kafka.properties.security.protocol' = 'SASL_PLAINTEXT',
+'lookup.alert.kafka.properties.sasl.mechanism'    = 'GSSAPI',
+'lookup.alert.kafka.properties.sasl.kerberos.service.name' = 'kafka',
+'lookup.alert.kafka.properties.sasl.jaas.config' = 'com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true keyTab="/etc/security/keytabs/ro.keytab" principal="ro@EXAMPLE.COM";'
 ```
 
 默认模板渲染（连续 10 批降级、波及 500 个 key）：
@@ -317,12 +341,28 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `${reason}` / `${subtask}` | 最近一次失败原因 `异常类名: message` / 子任务号如 `1/4` |
 | `${timestamp}` / `${datetime}` | epoch 毫秒 / 带时区 ISO-8601 |
 
-**四条容易踩的**：
+默认恢复模板渲染为：
 
-1. **边沿触发，一次故障只推一条**。计数「恰好等于」阈值那一批推，之后继续降级不再重复推——否则持续故障会每 n 批推一条，把 Kafka 变成另一个日志洪峰。重新武装的唯一条件是**主源成功一批**；故障是否仍在持续，看统计日志的 `降级=` 与限流 WARN。
-2. **并行度会放大条数**。计数是每个子任务独立的，并行度 4 时同一次故障最多 4 条（各自在第 n 批触发），消息里带 `subtask`，下游按「表 + 时间窗」去重即可。`n × 单批耗时 ≈ 容忍时长`：`lookup.timeout=500ms` 下 10 批 ≈ 5 秒、60 批 ≈ 30 秒。
-3. **旁路保障**：投递在独立守护线程 + 有界队列里做，`send()` 只入队——`KafkaProducer.send()` 在元数据不可用时最长阻塞 60 秒，直接在降级回调里调会把维表查询拖死。Kafka 不可达、队列打满（丢一条 WARN）、生产者创建失败，都只影响告警，**不影响任何一次查询**。
-4. **模板规则**：占位符替换成**已做 JSON 转义、不含引号**的内容，所以字符串字段自己加引号、数字字段裸写；模板必须以 `{}` 或 `[]` 包裹，占位符名须在白名单内——两者都在建表期校验，避免「告警发出去但字段永远缺失」。
+```json
+{"alert":"dual-lookup-recovered","table":"dim_account","primary":"hbase","standby":"doris","subtask":"1/4","timestamp":1794141859631,"datetime":"2026-11-08T20:44:19.631+08:00"}
+```
+
+可通过 `lookup.alert.recovery.message` 完全自定义；它和降级消息使用同一套占位符（恢复时 `${consecutive}`/`${affectedKeys}` 为 0，`${reason}` 为 `primary recovered`），建表期同样校验 JSON 外形和占位符白名单。
+
+**七条容易踩的**：
+
+1. **边沿触发 + 冷却窗**。计数「恰好等于」阈值那一批才尝试推送；同一张表、同一 topic 在 `lookup.alert.cooldown` 分钟（默认 3）内只发一条。冷却键是 `表 + topic`，在同一个 JVM 内跨子任务生效；跨 TM 仍可能各发一条，完全去重需要下游按 `table + 时间窗` 聚合。重新武装的条件仍是**主源成功一批**。
+2. **恢复通知**。本轮真正触发过降级告警后，主源恢复会推一条固定 JSON：`{"alert":"dual-lookup-recovered",...}`；`lookup.alert.recovery=false` 可关闭。它不受降级冷却窗约束，但同一故障周期只发一次。
+3. **并行度会放大条数**。计数是每个子任务独立的；冷却窗只能压掉同 TM 的重复。`n × 单批耗时 ≈ 容忍时长`：`lookup.timeout=500ms` 下 10 批 ≈ 5 秒、60 批 ≈ 30 秒。
+4. **旁路保障（v1.4 加固）**：投递在独立守护线程 + 有界队列里做，`send()` 只入队——`KafkaProducer.send()` 在元数据不可用时最长阻塞 60 秒，直接在降级回调里调会把维表查询拖死。Kafka 不可达、队列打满、生产者创建失败、同步/异步发送失败、topic 不存在、Kerberos/SASL 认证失败，都只记录失败原因，**不影响任何一次查询，也不让作业失败**。
+5. **有界重试 + 死信**。投递失败按 `lookup.alert.retry.max` 做指数退避重试；最终失败尽量写入 `lookup.alert.spool.dir` 下的 JSONL 死信，单文件受 `spool.max-bytes` 限制。队列打满时只 WARN/计数，不同步写盘，避免磁盘 IO 拖慢降级回调；死信只落盘，不自动重放，需外部补偿。
+6. **指标**：`dualLookupAlertTriggered` / `Sent` / `Failed` / `Dropped` / `Retries` / `Suppressed` / `Recovery` / `Spooled` 会注册到算子 MetricGroup（仅告警启用时）。
+7. **模板规则**：占位符替换成**已做 JSON 转义、不含引号**的内容，所以字符串字段自己加引号、数字字段裸写；模板必须以 `{}` 或 `[]` 包裹，占位符名须在白名单内——两者都在建表期校验，避免「告警发出去但字段永远缺失」。
+
+> 失败日志关键字：`告警初始化失败` / `告警队列已满` / `告警生产者创建失败` / `告警发送失败` / `告警投递失败` / `告警本地死信写入失败`。
+>
+> 真实 Kafka 集成测试默认跳过；启用：
+> `mvn test -Ddual.lookup.kafka.bootstrap=localhost:9092 -Ddual.lookup.kafka.topic=dual_lookup_alert_it`。
 
 > 关闭方式：`lookup.alert.threshold = 0`（默认），此时不创建生产者、不起任何线程。
 
@@ -357,6 +397,11 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `keytab 不可读` 但 Flink 登录正常 | 新版降级复用并 WARN；要显式用 keytab 则确认每台 TM 可读 |
 | 时间类型主键命中率偏低 | 新版已把 Timestamp/LocalDateTime 归一化并截断到微秒；旧包需升级 |
 | 反复出现 `failed to push metrics to pushgateway` | 1.2.4+ 会静音该 logger；仍出现就确认加载新 jar、Flink 用 Log4j2 |
+| `告警生产者创建失败` / `告警发送失败` | Kafka 认证、网络、参数或 topic 问题；只影响告警，作业继续 |
+| `告警投递失败` | topic 不存在、权限不足或 broker 返回错误；消息未送达，查询不受影响 |
+| `告警队列已满` | Kafka 长时间不可达，告警被丢弃；看累计条数与 Kafka 健康 |
+| `告警已写入本地死信` | 重试耗尽后落到 `lookup.alert.spool.dir`；需要外部补偿/重放 |
+| 冷却窗内没有新告警 | `lookup.alert.cooldown` 默认 3 分钟；看 `Suppressed` 指标确认 |
 | TaskManager 连接数过多 | 并行度 × `doris.pool.size` 超出 Doris 承载 |
 
 ## 13. 限制与演进
@@ -364,11 +409,11 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 - 单列族；不支持嵌套主键。
 - **无熔断器**：主源持续宕机时每批仍要等满 `lookup.timeout`。
 - HBase `open()` 同步阻塞，建连失败会阻塞该批；建连耗时不计入 `lookup_cost_ms` / `lookup.timeout`，但计入墙钟时间。
-- 降级粒度为整批。**演进方向**：熔断器 → 主备结果对账 → 新数据源（实现 `LookupReader` 即可）→ 接 Flink Metric（`FunctionContext.getMetricGroup()` 可用，无需改 `RichAsyncFunction`）。
+- 降级粒度为整批。**演进方向**：熔断器 → 主备结果对账 → 新数据源（实现 `LookupReader` 即可）→ 统计/告警指标全面接入 Flink Metric（告警指标已接入，统计日志仍以日志为主）。
 
 ## 14. 开发与测试
 
-`mvn test` 116 个用例，不依赖任何外部服务，可进 CI。
+`mvn test` 127 个用例；真实 Kafka 集成测试默认跳过（见 10.1），其余不依赖外部服务，可进 CI。
 
 | 类 | 职责 |
 |---|---|
@@ -378,12 +423,17 @@ doris.pool.validation-timeout  ≤  doris.connect.timeout
 | `HBaseLookupReader` / `DorisLookupReader` | 单源批量查询（异步 / JDBC 模拟异步） |
 | `RowDataConverter` | Flink 内部值与 Java 对象双向转换 |
 | `LookupStats` | 定时统计日志 |
-| `FailoverAlertNotifier` | 连续降级计数、阈值边沿触发、JSON 模板渲染与转义（不依赖 Kafka） |
-| `KafkaAlertSink` | 告警旁路：懒建生产者、单线程有界队列异步投递、失败不外溢 |
+| `FailoverAlertNotifier` | 连续降级计数、阈值边沿触发、冷却窗、恢复通知、JSON 模板渲染（不依赖 Kafka） |
+| `KafkaAlertSink` | 告警旁路：懒建生产者、有界队列、重试退避、死信、SASL/SSL 透传、失败不外溢 |
+| `AlertMetrics` | 告警触发/成功/失败/丢弃/重试/抑制/恢复/死信指标 |
 
 新增配置项要改三处：`DualLookupOptions` 加 Option 与字段、`Config.from` 赋值、`DualLookupTableSourceFactory.optionalOptions()` 登记。
 
 ## 15. 变更与升级要点
+
+**v1.4（1.3.1 → 1.4.0）**：告警旁路增强——`lookup.alert.kafka.properties.*` 透传 SASL/GSSAPI/SSL/JAAS；`kafka-clients` 改 `provided` 消除重复依赖；应用层有界重试 + 指数退避 + 本地 JSONL 死信；Flink 告警指标；`client.id` 带 table/subtask；恢复通知（`lookup.alert.recovery.message` 可自定义 JSON）；关闭幂等；同表同 topic 冷却窗（默认 3 分钟，JVM 内跨子任务）；Kafka 队列/超时/重试可调。另修复 HBase/Doris close 清理、Doris open 失败清理、TIMESTAMP(7..9) 纳秒边界、子任务号线程名兜底。**升级动作**：确认每个节点 `$FLINK_HOME/lib` 已有 kafka-clients（通常随 flink-connector-kafka），否则告警禁用但作业正常；重打 jar 并重启。
+
+**v1.3.1（1.3.0 → 1.3.1）**：加固连续降级告警旁路的失败隔离——告警初始化、入队、生产者创建、同步发送、异步投递、队列满全部只记录原因，不向查询/降级链路抛异常；新增每次丢队列的累计计数。修复 HBase 行转换异常导致 Future 悬挂到超时、关闭后重连重新建连接、关闭后迟到 `asyncLookup` 重新初始化、Doris 超时调度关闭竞态；TIMESTAMP 字符串小数秒不再截断到秒；DECIMAL 整数转 BigDecimal 不再经过 double 丢精度。
 
 **v1.3（1.2.9 → 1.3.0）**：新增 `lookup.alert.*` 五个参数（默认全关，**不配就没有任何行为变化**，可直接替换 jar）；fat jar 内置 kafka-clients 3.6.2，体积 29MB → 约 34MB，与集群已有的会重复但 child-first 不影响功能；排除 zstd/lz4/snappy（生产者固定 `compression.type=none`，要开压缩需同改 pom 与 `KafkaAlertSink`）。升级动作：重打 jar → 各节点 `$FLINK_HOME/lib` 删旧包换新包 → 重启集群；判别生效看统计日志的**配置回显行**里是否出现 `alert.threshold=`（仅启用时出现）。
 

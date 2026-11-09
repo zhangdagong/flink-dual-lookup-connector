@@ -189,6 +189,15 @@ public final class DualLookupOptions {
                     + "\"timestamp\":${timestamp},\"datetime\":\"${datetime}\"}";
 
     /**
+     * 默认恢复消息模板。恢复消息同样支持占位符，默认结构便于下游用 {@code alert} 字段区分
+     * {@code dual-lookup-failover} 与 {@code dual-lookup-recovered}。
+     */
+    public static final String DEFAULT_ALERT_RECOVERY_MESSAGE =
+            "{\"alert\":\"dual-lookup-recovered\",\"table\":\"${table}\",\"primary\":\"${primary}\","
+                    + "\"standby\":\"${standby}\",\"subtask\":\"${subtask}\","
+                    + "\"timestamp\":${timestamp},\"datetime\":\"${datetime}\"}";
+
+    /**
      * 连续降级批数阈值：连续这么多批都降级到备源时，推送一条告警到 Kafka。<b>0（默认）表示关闭</b>。
      *
      * <p><b>为什么用「连续」而不是「累计」？</b>主源偶发抖动几分钟就恢复了，累计口径会把
@@ -241,6 +250,12 @@ public final class DualLookupOptions {
                     .stringType()
                     .defaultValue(DEFAULT_ALERT_MESSAGE);
 
+    /** 主源恢复消息模板（JSON，支持与降级消息相同的占位符）；仅 recovery=true 时使用 */
+    public static final ConfigOption<String> ALERT_KAFKA_RECOVERY_MESSAGE =
+            ConfigOptions.key("lookup.alert.recovery.message")
+                    .stringType()
+                    .defaultValue(DEFAULT_ALERT_RECOVERY_MESSAGE);
+
     /**
      * 生产者 {@code acks}，默认 {@code 1}（leader 落盘即返回）。
      *
@@ -252,6 +267,94 @@ public final class DualLookupOptions {
             ConfigOptions.key("lookup.alert.kafka.acks")
                     .stringType()
                     .defaultValue("1");
+
+    /** 同一张表（同一 topic）在多少分钟内不重复推送降级告警；0 表示不做时间窗去重 */
+    public static final ConfigOption<Integer> ALERT_COOLDOWN_MINUTES =
+            ConfigOptions.key("lookup.alert.cooldown")
+                    .intType()
+                    .defaultValue(3);
+
+    /** 主源恢复后是否推送一条 recovery 消息（模板见 lookup.alert.recovery.message） */
+    public static final ConfigOption<Boolean> ALERT_RECOVERY_ENABLED =
+            ConfigOptions.key("lookup.alert.recovery")
+                    .booleanType()
+                    .defaultValue(true);
+
+    /** 告警投递失败后的应用层重试次数（不含第一次尝试） */
+    public static final ConfigOption<Integer> ALERT_RETRY_MAX =
+            ConfigOptions.key("lookup.alert.retry.max")
+                    .intType()
+                    .defaultValue(2);
+
+    /** 首次重试退避毫秒；后续按 2 的幂增长，受 backoff-max 限制 */
+    public static final ConfigOption<Integer> ALERT_RETRY_BACKOFF_MS =
+            ConfigOptions.key("lookup.alert.retry.backoff-ms")
+                    .intType()
+                    .defaultValue(500);
+
+    /** 退避上限毫秒，避免故障期间长时间占住告警线程 */
+    public static final ConfigOption<Integer> ALERT_RETRY_BACKOFF_MAX_MS =
+            ConfigOptions.key("lookup.alert.retry.backoff-max-ms")
+                    .intType()
+                    .defaultValue(5_000);
+
+    /**
+     * 最终投递失败后的本地死信目录；为空表示不落盘。
+     *
+     * <p>死信文件为 JSONL，一行一条，包含原始 payload 与失败原因；按 client.id 分文件。
+     */
+    public static final ConfigOption<String> ALERT_SPOOL_DIR =
+            ConfigOptions.key("lookup.alert.spool.dir")
+                    .stringType()
+                    .defaultValue("");
+
+    /** 单个死信文件上限；超过后丢弃新告警并打 WARN，避免 Kafka 长期不可用打满磁盘 */
+    public static final ConfigOption<Integer> ALERT_SPOOL_MAX_BYTES =
+            ConfigOptions.key("lookup.alert.spool.max-bytes")
+                    .intType()
+                    .defaultValue(10 * 1024 * 1024);
+
+    /** 生产者 client.id；留空时自动生成 `dual-lookup-alert-<table>-<subtask>` */
+    public static final ConfigOption<String> ALERT_KAFKA_CLIENT_ID =
+            ConfigOptions.key("lookup.alert.kafka.client-id")
+                    .stringType()
+                    .defaultValue("");
+
+    /** 待发告警队列容量 */
+    public static final ConfigOption<Integer> ALERT_KAFKA_QUEUE_CAPACITY =
+            ConfigOptions.key("lookup.alert.kafka.queue-capacity")
+                    .intType()
+                    .defaultValue(8);
+
+    /** KafkaProducer max.block.ms；只在告警线程上阻塞 */
+    public static final ConfigOption<Integer> ALERT_KAFKA_MAX_BLOCK_MS =
+            ConfigOptions.key("lookup.alert.kafka.max-block-ms")
+                    .intType()
+                    .defaultValue(5_000);
+
+    /** KafkaProducer request.timeout.ms */
+    public static final ConfigOption<Integer> ALERT_KAFKA_REQUEST_TIMEOUT_MS =
+            ConfigOptions.key("lookup.alert.kafka.request-timeout-ms")
+                    .intType()
+                    .defaultValue(5_000);
+
+    /** KafkaProducer delivery.timeout.ms，也是单次 send().get() 的等待上限 */
+    public static final ConfigOption<Integer> ALERT_KAFKA_DELIVERY_TIMEOUT_MS =
+            ConfigOptions.key("lookup.alert.kafka.delivery-timeout-ms")
+                    .intType()
+                    .defaultValue(15_000);
+
+    /** KafkaProducer 内部重试次数 */
+    public static final ConfigOption<Integer> ALERT_KAFKA_RETRIES =
+            ConfigOptions.key("lookup.alert.kafka.retries")
+                    .intType()
+                    .defaultValue(2);
+
+    /** 作业关闭时等待告警冲刷的上限 */
+    public static final ConfigOption<Integer> ALERT_KAFKA_CLOSE_TIMEOUT_MS =
+            ConfigOptions.key("lookup.alert.kafka.close-timeout-ms")
+                    .intType()
+                    .defaultValue(5_000);
 
     // ==================== HBase ====================
 
@@ -505,8 +608,31 @@ public final class DualLookupOptions {
         public int alertThreshold;         // 连续降级批数阈值，0 = 关闭告警
         public String alertKafkaBootstrap; // 告警 Kafka 地址（逗号分隔）
         public String alertKafkaTopic;     // 告警 topic
-        public String alertKafkaMessage;   // 告警 JSON 模板（含 ${占位符}）
+        public String alertKafkaMessage;   // 降级告警 JSON 模板（含 ${占位符}）
+        public String alertKafkaRecoveryMessage; // 恢复告警 JSON 模板
         public String alertKafkaAcks;      // 生产者 acks
+        public int alertCooldownMinutes;   // 同表同 topic 告警冷却分钟数，0 = 不去重
+        public boolean alertRecovery;      // 主源恢复后是否推送 recovery
+        public int alertRetryMax;          // 应用层重试次数（不含首次）
+        public int alertRetryBackoffMs;    // 首次退避
+        public int alertRetryBackoffMaxMs; // 退避上限
+        public String alertSpoolDir;       // 本地死信目录，空 = 不落盘
+        public int alertSpoolMaxBytes;     // 单个死信文件上限
+        public String alertKafkaClientId;  // 为空则按 table/subtask 自动生成
+        public int alertKafkaQueueCapacity;
+        public int alertKafkaMaxBlockMs;
+        public int alertKafkaRequestTimeoutMs;
+        public int alertKafkaDeliveryTimeoutMs;
+        public int alertKafkaRetries;
+        public int alertKafkaCloseTimeoutMs;
+        /**
+         * DDL 中 {@code lookup.alert.kafka.properties.*} 去掉前缀后的 Kafka 客户端配置。
+         *
+         * <p>用于 SASL/GSSAPI、SSL、JAAS 等场景，例如：
+         * {@code security.protocol=SASL_PLAINTEXT}、{@code sasl.mechanism=GSSAPI}、
+         * {@code sasl.kerberos.service.name=kafka}、{@code ssl.truststore.location=...}。
+         */
+        public Map<String, String> alertKafkaProperties;
 
         public String hbaseTableName;
         public String hbaseZkQuorum;
@@ -598,9 +724,22 @@ public final class DualLookupOptions {
          */
         public static Config from(ReadableConfig c, String ddlTableName,
                                   Map<String, String> hbaseProperties, ReadableConfig globalConfig) {
+            return from(c, ddlTableName, hbaseProperties, globalConfig,
+                    Collections.<String, String>emptyMap());
+        }
+
+        /**
+         * @param alertKafkaProperties DDL 中 {@code lookup.alert.kafka.properties.*} 去掉前缀后的键值对
+         */
+        public static Config from(ReadableConfig c, String ddlTableName,
+                                  Map<String, String> hbaseProperties, ReadableConfig globalConfig,
+                                  Map<String, String> alertKafkaProperties) {
             Config cfg = new Config();
             cfg.hbaseProperties = new HashMap<>(
                     hbaseProperties == null ? Collections.<String, String>emptyMap() : hbaseProperties);
+            cfg.alertKafkaProperties = new HashMap<>(
+                    alertKafkaProperties == null
+                            ? Collections.<String, String>emptyMap() : alertKafkaProperties);
 
             // ---- 主备路由：只声明主源，备源由代码推导，避免用户配出「主备同源」的无效组合 ----
             cfg.primary = normalize(c.get(PRIMARY));
@@ -614,12 +753,27 @@ public final class DualLookupOptions {
             cfg.statsLogIntervalSec = c.get(STATS_LOG_INTERVAL);
             cfg.failoverLogIntervalSec = c.get(FAILOVER_LOG_INTERVAL);
 
-            // 告警是旁路：未启用时下面四个字段可能为空，运行期也就不会构造任何 Kafka 对象
+            // 告警是旁路：未启用时相关字段可能为空，运行期也就不会构造任何 Kafka 对象
             cfg.alertThreshold = c.get(ALERT_THRESHOLD);
             cfg.alertKafkaBootstrap = c.getOptional(ALERT_KAFKA_BOOTSTRAP).orElse("").trim();
             cfg.alertKafkaTopic = c.getOptional(ALERT_KAFKA_TOPIC).orElse("").trim();
             cfg.alertKafkaMessage = c.get(ALERT_KAFKA_MESSAGE);
+            cfg.alertKafkaRecoveryMessage = c.get(ALERT_KAFKA_RECOVERY_MESSAGE);
             cfg.alertKafkaAcks = c.get(ALERT_KAFKA_ACKS).trim().toLowerCase(Locale.ROOT);
+            cfg.alertCooldownMinutes = c.get(ALERT_COOLDOWN_MINUTES);
+            cfg.alertRecovery = c.get(ALERT_RECOVERY_ENABLED);
+            cfg.alertRetryMax = c.get(ALERT_RETRY_MAX);
+            cfg.alertRetryBackoffMs = c.get(ALERT_RETRY_BACKOFF_MS);
+            cfg.alertRetryBackoffMaxMs = c.get(ALERT_RETRY_BACKOFF_MAX_MS);
+            cfg.alertSpoolDir = c.get(ALERT_SPOOL_DIR).trim();
+            cfg.alertSpoolMaxBytes = c.get(ALERT_SPOOL_MAX_BYTES);
+            cfg.alertKafkaClientId = c.get(ALERT_KAFKA_CLIENT_ID).trim();
+            cfg.alertKafkaQueueCapacity = c.get(ALERT_KAFKA_QUEUE_CAPACITY);
+            cfg.alertKafkaMaxBlockMs = c.get(ALERT_KAFKA_MAX_BLOCK_MS);
+            cfg.alertKafkaRequestTimeoutMs = c.get(ALERT_KAFKA_REQUEST_TIMEOUT_MS);
+            cfg.alertKafkaDeliveryTimeoutMs = c.get(ALERT_KAFKA_DELIVERY_TIMEOUT_MS);
+            cfg.alertKafkaRetries = c.get(ALERT_KAFKA_RETRIES);
+            cfg.alertKafkaCloseTimeoutMs = c.get(ALERT_KAFKA_CLOSE_TIMEOUT_MS);
 
             // getOptional(...).orElse(ddlTableName)：表名支持「不配就与 DDL 表名同名」的快捷写法
             cfg.hbaseTableName = c.getOptional(HBASE_TABLE_NAME).orElse(ddlTableName);
@@ -753,10 +907,47 @@ public final class DualLookupOptions {
                             "[dual-lookup] lookup.alert.kafka.acks 只能取值 0、1、all（或 -1），当前为: "
                                     + cfg.alertKafkaAcks);
                 }
+                if (cfg.alertCooldownMinutes < 0) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.cooldown 不能为负，0 表示不做时间窗去重");
+                }
+                if (cfg.alertRetryMax < 0) {
+                    throw new IllegalArgumentException("[dual-lookup] lookup.alert.retry.max 不能为负");
+                }
+                if (cfg.alertRetryBackoffMs < 0 || cfg.alertRetryBackoffMaxMs < 0) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.retry.backoff-ms / backoff-max-ms 不能为负");
+                }
+                if (cfg.alertRetryBackoffMaxMs < cfg.alertRetryBackoffMs) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.retry.backoff-max-ms 不能小于 lookup.alert.retry.backoff-ms");
+                }
+                if (cfg.alertKafkaQueueCapacity <= 0) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.kafka.queue-capacity 必须大于 0");
+                }
+                if (cfg.alertKafkaMaxBlockMs <= 0 || cfg.alertKafkaRequestTimeoutMs <= 0
+                        || cfg.alertKafkaDeliveryTimeoutMs <= 0 || cfg.alertKafkaCloseTimeoutMs <= 0) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.kafka.max-block-ms / request-timeout-ms / "
+                                    + "delivery-timeout-ms / close-timeout-ms 必须大于 0");
+                }
+                if (cfg.alertKafkaDeliveryTimeoutMs < cfg.alertKafkaRequestTimeoutMs) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.kafka.delivery-timeout-ms 不能小于 request-timeout-ms");
+                }
+                if (cfg.alertKafkaRetries < 0) {
+                    throw new IllegalArgumentException("[dual-lookup] lookup.alert.kafka.retries 不能为负");
+                }
+                if (!cfg.alertSpoolDir.isEmpty() && cfg.alertSpoolMaxBytes <= 0) {
+                    throw new IllegalArgumentException(
+                            "[dual-lookup] lookup.alert.spool.max-bytes 必须大于 0");
+                }
             }
             // 模板无条件校验：即使当前没启用告警，模板写错（占位符拼错、漏写花括号）也该立刻暴露，
             // 而不是等到某天启用后才发现告警体是坏的——那时恰恰是故障现场
             FailoverAlertNotifier.validateTemplate(cfg.alertKafkaMessage);
+            FailoverAlertNotifier.validateTemplate(cfg.alertKafkaRecoveryMessage);
 
             // ---- 超时预算的四条交叉校验 ----
             // 这几个参数单独看都合法，组合起来才会失效，因此必须放在跨字段校验里拦（README 已把它们列为反模式）

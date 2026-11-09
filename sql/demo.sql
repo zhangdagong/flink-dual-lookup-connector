@@ -2,9 +2,9 @@
 -- dual-lookup 示例：Kafka 交易流水 × 双源维表（HBase 主 / Doris 备）
 --
 -- 前置条件
---   1) jar 1.2.9+ 已构建并放到 JM 与所有 TM 的 $FLINK_HOME/lib，集群已重启
+--   1) jar 1.4.0+ 已构建并放到 JM 与所有 TM 的 $FLINK_HOME/lib，集群已重启
 --      （打包后用 jar tf | grep 自查 jar 内没有 Hadoop/htrace 类）
---      旧版 jar（1.0.x ~ 1.2.8）必须删除，否则可能仍报 properties.* 不可用或没有新行为
+--      旧版 jar（1.0.x ~ 1.3.1）必须删除，否则可能仍报 properties.* 不可用或没有新行为
 --   2) HBase 2.2.7：表 dim:dim_account，列族 cf，业务列按同名列写入
 --   3) Doris：表 dim.dim_account，列名与下方 DDL 完全一致
 --
@@ -106,17 +106,32 @@ CREATE TABLE dim_account (
 
     -- ===== 连续降级告警（可选，v1.3+；默认关闭）=====
     -- 语义：主源任意一批成功即清零；连续 N 批都降级到备源时，推一条 JSON 到 Kafka。
-    -- 一次故障只推一条（边沿触发）；并行度 4 时最多收到 4 条，消息里带 subtask 便于去重。
+    -- 冷却：同表同 topic 默认 3 分钟内不重复降级告警；主源恢复可再推 recovery。
+    -- 并行度 4 时最多收到 4 条（跨 TM 的冷却窗不共享），消息里带 subtask 便于去重。
     -- 'lookup.alert.threshold'               = '10',      -- 连续降级批数；0 = 关闭（默认）
                                                           -- 物理含义 ≈ 容忍主源抖动 N × 单批耗时
     -- 'lookup.alert.kafka.bootstrap-servers' = 'localhost:9092',
     -- 'lookup.alert.kafka.topic'             = 'dual_lookup_alert',
     -- 'lookup.alert.kafka.acks'              = '1',        -- 0 | 1 | all
+    -- 'lookup.alert.cooldown'                = '3',        -- 同表同 topic 冷却分钟数；0 = 不去重
+    -- 'lookup.alert.recovery'                = 'true',     -- 主源恢复后推 recovery
+    -- 'lookup.alert.retry.max'               = '2',        -- 应用层重试次数
+    -- 'lookup.alert.retry.backoff-ms'        = '500',      -- 首次退避，指数增长
+    -- 'lookup.alert.retry.backoff-max-ms'    = '5000',
+    -- 'lookup.alert.spool.dir'               = '/data/flink/alert-deadletter', -- 死信目录
+    -- 'lookup.alert.spool.max-bytes'         = '10485760',
+    -- Kafka 客户端透传参数（SASL/GSSAPI/SSL/JAAS）
+    -- 'lookup.alert.kafka.properties.security.protocol' = 'SASL_PLAINTEXT',
+    -- 'lookup.alert.kafka.properties.sasl.mechanism'    = 'GSSAPI',
+    -- 'lookup.alert.kafka.properties.sasl.kerberos.service.name' = 'kafka',
     -- 自定义消息（可选；在 SQL 里用单引号包整个模板，内部一律双引号）。
     -- 占位符：table primary standby threshold consecutive affectedKeys reason subtask timestamp datetime
     -- 占位符替换成「已转义的内容、不含引号」：字符串字段自己加引号，数字字段裸写。
     -- 'lookup.alert.kafka.message' = '{"level":"P1","table":"${table}","n":${consecutive},'
     --                                + '"keys":${affectedKeys},"reason":"${reason}"}',
+    -- 恢复消息也可自定义 JSON（占位符同降级消息）
+    -- 'lookup.alert.recovery.message' = '{"level":"INFO","event":"recovered",'
+    --                                + '"table":"${table}","subtask":"${subtask}"}',
 
     -- ===== HBase =====
     'hbase.zookeeper.quorum'            = '127.0.0.1',

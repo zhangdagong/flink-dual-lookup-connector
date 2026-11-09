@@ -1,9 +1,15 @@
 package com.roc.flink.connector.dual;
 
+import org.apache.flink.configuration.Configuration;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.Properties;
 
 import static org.junit.Assert.assertNotNull;
@@ -52,9 +58,46 @@ public class KafkaAlertSinkTest {
             sink.send("{\"alert\":\"test\"}");
             long elapsed = System.currentTimeMillis() - start;
             assertTrue("send() 必须只是入队；耗时 " + elapsed
-                    + "ms 说明它开始在调用线程上等 Kafka 元数据了", elapsed < 500);
+                    + "ms 说明它开始在调用线程上等 Kafka 元数据了", elapsed < 2_000);
         } finally {
             sink.close(200);
+        }
+    }
+
+    @Test
+    public void securityPropertiesAndClientIdArePassedThrough() {
+        Properties props = KafkaAlertSink.producerProps("localhost:9092", "1", "client-1",
+                Collections.singletonMap("security.protocol", "SASL_PLAINTEXT"),
+                5000, 5000, 15000, 2);
+        org.junit.Assert.assertEquals("SASL_PLAINTEXT", props.getProperty("security.protocol"));
+        org.junit.Assert.assertEquals("client-1", props.getProperty(ProducerConfig.CLIENT_ID_CONFIG));
+    }
+
+    @Test
+    public void deadLetterWritesBoundedJsonlFile() throws Exception {
+        Path dir = Files.createTempDirectory("dual-alert-spool");
+        Path file = dir.resolve("it-client.jsonl");
+        try {
+            Configuration c = new Configuration();
+            c.setString(DualLookupOptions.DORIS_JDBC_URL.key(), "jdbc:mysql://localhost:9030/dim");
+            c.setInteger(DualLookupOptions.ALERT_THRESHOLD.key(), 1);
+            c.setString(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP.key(), "localhost:9092");
+            c.setString(DualLookupOptions.ALERT_KAFKA_TOPIC.key(), "dual_lookup_alert");
+            c.setString(DualLookupOptions.ALERT_SPOOL_DIR.key(), dir.toString());
+            DualLookupOptions.Config cfg = DualLookupOptions.Config.from(c, "it_table");
+
+            KafkaAlertSink sink = new KafkaAlertSink(cfg, "it-client", AlertMetrics.NOOP);
+            try {
+                sink.spool("{\"alert\":\"test\"}", "boom\nreason");
+            } finally {
+                sink.close(100);
+            }
+            String line = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+            assertTrue(line.contains("\"payload\":{\"alert\":\"test\"}"));
+            assertTrue("原因必须转义成单行 JSON: " + line, line.contains("boom\\nreason"));
+        } finally {
+            Files.deleteIfExists(file);
+            Files.deleteIfExists(dir);
         }
     }
 

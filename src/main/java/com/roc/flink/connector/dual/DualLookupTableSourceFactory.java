@@ -36,6 +36,8 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
 
     /** 与 flink-hbase 一致的 HBase 客户端属性透传前缀 */
     private static final String PROPERTIES_PREFIX = "properties.";
+    /** Kafka 告警客户端的 SASL/GSSAPI/SSL/JAAS 等属性透传前缀 */
+    private static final String KAFKA_PROPERTIES_PREFIX = "lookup.alert.kafka.properties.";
 
     /**
      * 由 DDL 构建 TableSource。本方法在建表阶段（SQL 解析/校验期）被调用，
@@ -51,7 +53,7 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         // ⚠️ 不能改回 helper.validate()：那样 `properties.hbase.security.authentication`、
         // `properties.hbase.master.kerberos.principal` 等从 flink-hbase 迁过来的参数
         // 会全部被判为「未知配置」，建表直接失败。
-        helper.validateExcept(PROPERTIES_PREFIX);
+        helper.validateExcept(PROPERTIES_PREFIX, KAFKA_PROPERTIES_PREFIX);
 
         // 主键强校验：Lookup Join 的本质是「按 key 点查」，没有主键就无法构成点查语义，
         // 提前拦下比运行期报错更友好
@@ -76,16 +78,20 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
 
         // 收集 properties.* 透传项（去掉前缀），运行期写入 HBase Configuration
         Map<String, String> hbaseProperties = new HashMap<>();
+        Map<String, String> alertKafkaProperties = new HashMap<>();
         for (Map.Entry<String, String> option : context.getCatalogTable().getOptions().entrySet()) {
             if (option.getKey().startsWith(PROPERTIES_PREFIX)) {
                 hbaseProperties.put(option.getKey().substring(PROPERTIES_PREFIX.length()), option.getValue());
+            } else if (option.getKey().startsWith(KAFKA_PROPERTIES_PREFIX)) {
+                alertKafkaProperties.put(
+                        option.getKey().substring(KAFKA_PROPERTIES_PREFIX.length()), option.getValue());
             }
         }
 
         // 第四个参数是 Session 级配置：table.exec.async-lookup.timeout 不在 WITH 选项里，
         // 只从 helper.getOptions() 读会永远拿到 Flink 默认的 3 分钟，第 (4) 条交叉校验就形同虚设。
         DualLookupOptions.Config cfg = DualLookupOptions.Config.from(
-                config, tableName, hbaseProperties, context.getConfiguration());
+                config, tableName, hbaseProperties, context.getConfiguration(), alertKafkaProperties);
         return new DualLookupTableSource(cfg, tableName, fieldNames, fieldTypes);
     }
 
@@ -122,7 +128,22 @@ public class DualLookupTableSourceFactory implements DynamicTableSourceFactory {
         optional.add(DualLookupOptions.ALERT_KAFKA_BOOTSTRAP);
         optional.add(DualLookupOptions.ALERT_KAFKA_TOPIC);
         optional.add(DualLookupOptions.ALERT_KAFKA_MESSAGE);
+        optional.add(DualLookupOptions.ALERT_KAFKA_RECOVERY_MESSAGE);
         optional.add(DualLookupOptions.ALERT_KAFKA_ACKS);
+        optional.add(DualLookupOptions.ALERT_COOLDOWN_MINUTES);
+        optional.add(DualLookupOptions.ALERT_RECOVERY_ENABLED);
+        optional.add(DualLookupOptions.ALERT_RETRY_MAX);
+        optional.add(DualLookupOptions.ALERT_RETRY_BACKOFF_MS);
+        optional.add(DualLookupOptions.ALERT_RETRY_BACKOFF_MAX_MS);
+        optional.add(DualLookupOptions.ALERT_SPOOL_DIR);
+        optional.add(DualLookupOptions.ALERT_SPOOL_MAX_BYTES);
+        optional.add(DualLookupOptions.ALERT_KAFKA_CLIENT_ID);
+        optional.add(DualLookupOptions.ALERT_KAFKA_QUEUE_CAPACITY);
+        optional.add(DualLookupOptions.ALERT_KAFKA_MAX_BLOCK_MS);
+        optional.add(DualLookupOptions.ALERT_KAFKA_REQUEST_TIMEOUT_MS);
+        optional.add(DualLookupOptions.ALERT_KAFKA_DELIVERY_TIMEOUT_MS);
+        optional.add(DualLookupOptions.ALERT_KAFKA_RETRIES);
+        optional.add(DualLookupOptions.ALERT_KAFKA_CLOSE_TIMEOUT_MS);
 
         // HBase 连接与超时
         optional.add(DualLookupOptions.HBASE_TABLE_NAME);

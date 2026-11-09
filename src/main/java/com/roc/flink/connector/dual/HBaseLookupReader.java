@@ -98,6 +98,8 @@ public class HBaseLookupReader implements LookupReader {
      * 用 ScheduledThreadPoolExecutor 而非 Executors 工厂方法：后者返回的是包装类，
      * 拿不到队列句柄，无法观测「已完成查询的超时任务是否被及时清理」 */
     private transient ScheduledThreadPoolExecutor timeoutScheduler;
+    /** 是否已关闭；防止关闭后重连任务又把连接建起来（资源泄漏/关闭后仍查询） */
+    private transient volatile boolean closed;
     /**
      * 专门执行「断连重连」的线程池。
      *
@@ -138,6 +140,9 @@ public class HBaseLookupReader implements LookupReader {
      */
     @Override
     public synchronized void open() throws Exception {
+        if (closed) {
+            throw new IllegalStateException("HBaseLookupReader is closed");
+        }
         AsyncConnection existing = connection;
         if (opened && existing != null && !existing.isClosed()) {
             return;
@@ -221,12 +226,15 @@ public class HBaseLookupReader implements LookupReader {
             this.familyBytes = Bytes.toBytes(cfg.hbaseColumnFamily);
             // 放在最后：以上任一步骤抛异常，opened 仍为 false，下次查询会重新尝试建连
             opened = true;
-        } catch (Exception e) {
+        } catch (Throwable t) {
             // 预热点（region location）失败时连接已经建立，必须显式关闭它。
             // 否则下次 open() 会用新连接覆盖字段，旧连接的 Netty 线程池与 ZK 会话将永久泄漏——
             // 这类泄漏在「HBase 刚重启、region 尚未上线」的窗口期会每批次发生一次，很容易把 TM 拖垮。
             closeQuietly(conn);
-            throw e;
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            throw (Error) t;
         }
         // rowkey 编码模式务必打出来：它决定了「能不能查到数据」，是排查「HBase 全部查不到」时的第一现场
         LOG.info("[dual-lookup] HBase reader opened, table={}, family={}, zk={}, rowkeyEncoding={}",
@@ -514,21 +522,28 @@ public class HBaseLookupReader implements LookupReader {
      */
     @Override
     public synchronized void close() throws Exception {
-        if (timeoutScheduler != null) {
-            timeoutScheduler.shutdownNow();
-            timeoutScheduler = null;
-        }
-        if (reconnectExecutor != null) {
-            reconnectExecutor.shutdownNow();
-            reconnectExecutor = null;
-        }
-        if (connection != null) {
-            connection.close();
+        closed = true;
+        try {
+            if (timeoutScheduler != null) {
+                timeoutScheduler.shutdownNow();
+                timeoutScheduler = null;
+            }
+            if (reconnectExecutor != null) {
+                reconnectExecutor.shutdownNow();
+                reconnectExecutor = null;
+            }
+            if (connection != null) {
+                connection.close();
+            }
+        } catch (Throwable t) {
+            // close 是清理路径：单个资源关闭失败不能跳过后续清理，也不能让作业取消失败
+            LOG.warn("[dual-lookup] HBase 资源关闭异常（已忽略剩余清理）：{}", t.toString());
+        } finally {
             connection = null;
+            table = null;
+            familyBytes = null;
+            opened = false;
         }
-        table = null;
-        familyBytes = null;
-        opened = false;
     }
 
     // ---------------- 查询 ----------------
@@ -619,15 +634,21 @@ public class HBaseLookupReader implements LookupReader {
                             result.completeExceptionally(cause);
                             return;
                         }
-                        Map<Integer, List<Map<String, Object>>> map = new HashMap<>();
-                        for (int j = 0; j < futures.size(); j++) {
-                            Result r = futures.get(j).join(); // allOf 已完成，join 立即返回
-                            if (r != null && !r.isEmpty()) {
-                                // 未命中的 key 不写入 map：与「空结果不降级」的约定保持一致
-                                map.put(indexMap.get(j), toRows(r));
+                        try {
+                            Map<Integer, List<Map<String, Object>>> map = new HashMap<>();
+                            for (int j = 0; j < futures.size(); j++) {
+                                Result r = futures.get(j).join(); // allOf 已完成，join 立即返回
+                                if (r != null && !r.isEmpty()) {
+                                    // 未命中的 key 不写入 map：与「空结果不降级」的约定保持一致
+                                    map.put(indexMap.get(j), toRows(r));
+                                }
                             }
+                            result.complete(map);
+                        } catch (Throwable convertError) {
+                            // 行转换异常（类型不匹配、坏数据等）必须终结 Future；否则只能等
+                            // withTimeout 到点，把「数据问题」误报成「主源超时」并去查备源。
+                            result.completeExceptionally(unwrap(convertError));
                         }
-                        result.complete(map);
                     });
         } catch (Throwable t) {
             // table.get() 本身同步抛错（连接已关闭、表不存在等）
@@ -668,6 +689,11 @@ public class HBaseLookupReader implements LookupReader {
                 }
                 try {
                     synchronized (HBaseLookupReader.this) {
+                        if (closed) {
+                            result.completeExceptionally(
+                                    new IllegalStateException("HBaseLookupReader is closed", cause));
+                            return;
+                        }
                         // HBase 服务端回收的往往只是底层 RPC 连接，AsyncConnection.isClosed() 仍为 false，
                         // 所以这里按「实例是否是失败的那一条」来判断，强制替换掉它。
                         if (connection == failedConnection) {
@@ -724,12 +750,20 @@ public class HBaseLookupReader implements LookupReader {
             f.completeExceptionally(new IllegalStateException("[dual-lookup] HBaseLookupReader is closed"));
             return f;
         }
-        ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
-            if (!f.isDone()) { // 已完成则什么都不做，避免覆盖真实结果
-                f.completeExceptionally(
-                        new TimeoutException("HBase lookup timeout after " + timeoutMs + "ms"));
-            }
-        }, timeoutMs, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> timeoutTask;
+        try {
+            timeoutTask = scheduler.schedule(() -> {
+                if (!f.isDone()) { // 已完成则什么都不做，避免覆盖真实结果
+                    f.completeExceptionally(
+                            new TimeoutException("HBase lookup timeout after " + timeoutMs + "ms"));
+                }
+            }, timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // close() 在 isShutdown() 检查之后、schedule() 之前关掉了调度器
+            f.completeExceptionally(new IllegalStateException(
+                    "[dual-lookup] HBaseLookupReader is closed", e));
+            return f;
+        }
         // 查询提前结束时立即取消超时任务，不让它在单线程调度器队列里空待到到期
         // （高 QPS 下队列里会堆积大量「结果早已返回」的任务，到期逐个空转扫描）
         f.whenComplete((v, ex) -> timeoutTask.cancel(false));

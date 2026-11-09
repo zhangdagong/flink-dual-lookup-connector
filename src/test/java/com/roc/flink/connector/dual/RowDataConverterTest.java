@@ -188,13 +188,17 @@ public class RowDataConverterTest {
         assertEquals(expected, out.getTimestamp(0, 3).toLocalDateTime());
         assertEquals(expected, out.getTimestamp(1, 6).toLocalDateTime());
 
-        // 字符串形态：ISO 的 'T' 分隔 + 小数秒截断；空格分隔原样解析
+        // 字符串形态：ISO 的 'T' 分隔 + 小数秒必须保留（不能截断到秒）
         Map<String, Object> row2 = new HashMap<>();
-        row2.put("ts3", "2026-09-29T12:30:15.123456"); // 曾在此抛异常：'T' 替换被 length==19 漏掉
-        row2.put("ts6", "2026-09-29 12:30:15");
+        row2.put("ts3", "2026-09-29T12:30:15.123");
+        row2.put("ts6", "2026-09-29 12:30:15.123456");
         RowData out2 = c.toRowData(row2);
-        assertEquals(expected, out2.getTimestamp(0, 3).toLocalDateTime());
-        assertEquals(expected, out2.getTimestamp(1, 6).toLocalDateTime());
+        assertEquals("小数秒不能被丢弃",
+                LocalDateTime.of(2026, 9, 29, 12, 30, 15, 123_000_000),
+                out2.getTimestamp(0, 3).toLocalDateTime());
+        assertEquals("微秒精度必须保留",
+                LocalDateTime.of(2026, 9, 29, 12, 30, 15, 123_456_000),
+                out2.getTimestamp(1, 6).toLocalDateTime());
 
         // java.sql.Timestamp 原样透传
         Map<String, Object> row3 = new HashMap<>();
@@ -203,6 +207,24 @@ public class RowDataConverterTest {
         RowData out3 = c.toRowData(row3);
         assertEquals(expected, out3.getTimestamp(0, 3).toLocalDateTime());
         assertEquals(expected, out3.getTimestamp(1, 6).toLocalDateTime());
+    }
+
+    @Test
+    public void timestampPrecisionNinePreservesNanosecondsAndClampsExtraDigits() {
+        RowDataConverter c = conv(new String[]{"ts9"},
+                new LogicalType[]{new TimestampType(9)});
+        long millis = Timestamp.valueOf("2026-09-29 12:30:15").getTime();
+        LocalDateTime expected = LocalDateTime.of(2026, 9, 29, 12, 30, 15, 123_456_789);
+
+        Map<String, Object> numeric = new HashMap<>();
+        numeric.put("ts9", millis * 1_000_000L + 123_456_789L);
+        assertEquals("TIMESTAMP(9) 数值应按纳秒解释", expected,
+                c.toRowData(numeric).getTimestamp(0, 9).toLocalDateTime());
+
+        Map<String, Object> text = new HashMap<>();
+        // 超过 9 位的小数秒截到纳秒，不能因 Timestamp.valueOf 解析失败而整行失败
+        text.put("ts9", "2026-09-29T12:30:15.123456789123");
+        assertEquals(expected, c.toRowData(text).getTimestamp(0, 9).toLocalDateTime());
     }
 
     @Test

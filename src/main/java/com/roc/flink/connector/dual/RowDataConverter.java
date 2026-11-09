@@ -228,10 +228,22 @@ public class RowDataConverter implements Serializable {
         return Boolean.parseBoolean(v.toString());
     }
 
-    /** 统一转 BigDecimal（注意：走 double 分支会有精度损失风险，仅作为非精确类型的兜底路径） */
+    /**
+     * 统一转 BigDecimal。
+     *
+     * <p>整数类型优先走 {@code longValue()}，不要统一转 double：DECIMAL(38,0) 的
+     * BIGINT 主键/金额超过 2^53 后，double 会悄悄丢低位。Float/Double 本身已是
+     * 二进制近似值，用 {@code BigDecimal.valueOf(double)} 保留其十进制字符串表示。
+     */
     private static BigDecimal toBigDecimal(Object v) {
         if (v instanceof BigDecimal) {
             return (BigDecimal) v;
+        }
+        if (v instanceof java.math.BigInteger) {
+            return new BigDecimal((java.math.BigInteger) v);
+        }
+        if (v instanceof Byte || v instanceof Short || v instanceof Integer || v instanceof Long) {
+            return BigDecimal.valueOf(((Number) v).longValue());
         }
         if (v instanceof Number) {
             return BigDecimal.valueOf(((Number) v).doubleValue());
@@ -294,7 +306,22 @@ public class RowDataConverter implements Serializable {
             // 可能给 Integer/BigInteger，统一走这里才不会出现「同一种列、不同源解释不同」。
             long raw = ((Number) v).longValue();
             int precision = (type instanceof TimestampType) ? ((TimestampType) type).getPrecision() : 3;
-            return precision <= 3 ? new Timestamp(raw) : new Timestamp(raw / 1000L);
+            if (precision <= 3) {
+                return new Timestamp(raw);
+            }
+            Timestamp timestamp;
+            if (precision <= 6) {
+                // raw = 微秒；毫秒部分给 Timestamp，剩余微秒转纳秒写回。
+                // 用 floorDiv/floorMod 兼容 1970 年以前的负数时间戳。
+                timestamp = new Timestamp(Math.floorDiv(raw, 1_000L));
+                timestamp.setNanos((int) (Math.floorMod(raw, 1_000_000L) * 1_000L));
+            } else {
+                // TIMESTAMP(7..9)：按纳秒解释。Flink 的 TimestampData 用
+                // “毫秒 + 纳秒中的亚毫秒部分（0..999999）”表示，合起来仍可保留完整纳秒精度。
+                timestamp = new Timestamp(Math.floorDiv(raw, 1_000_000L));
+                timestamp.setNanos((int) Math.floorMod(raw, 1_000_000_000L));
+            }
+            return timestamp;
         }
         String s = v.toString().trim();
         // 兼容 "yyyy-MM-dd HH:mm:ss" 与 ISO 的 "yyyy-MM-ddTHH:mm:ss" 两种写法。
@@ -303,8 +330,15 @@ public class RowDataConverter implements Serializable {
         if (s.length() > 10 && s.charAt(10) == 'T') {
             s = s.replace('T', ' ');
         }
-        // 截断到秒：Timestamp.valueOf 无法解析小数秒之后的内容，多余部分直接丢弃
-        return Timestamp.valueOf(s.length() > 19 ? s.substring(0, 19) : s);
+        // Timestamp.valueOf 支持 1~9 位小数秒；超过 9 位的源串截到纳秒，
+        // 既保留 TIMESTAMP(3/6/9) 精度，也避免解析直接抛异常。
+        if (s.length() > 19) {
+            int dot = s.indexOf('.', 19);
+            if (dot > 0 && s.length() > dot + 10) {
+                s = s.substring(0, dot + 10);
+            }
+        }
+        return Timestamp.valueOf(s);
     }
 
     /** -> byte[]（已是的直接返回，否则按 UTF-8 编码） */

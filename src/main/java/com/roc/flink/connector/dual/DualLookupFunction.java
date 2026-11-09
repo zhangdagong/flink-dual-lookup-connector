@@ -1,5 +1,6 @@
 package com.roc.flink.connector.dual;
 
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.AsyncLookupFunction;
 import org.apache.flink.table.functions.FunctionContext;
@@ -12,6 +13,8 @@ import org.slf4j.LoggerFactory;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -56,6 +59,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(DualLookupFunction.class);
+    /** Flink 任务线程名通常带 (i/N)；只用于反射失败时的兜底解析 */
+    private static final Pattern SUBTASK_PATTERN = Pattern.compile("\\((\\d+)/(\\d+)\\)");
 
     static {
         // 进程级兜底：把 Flink PushGateway reporter 的 logger 设为 OFF。
@@ -121,8 +126,12 @@ public class DualLookupFunction extends AsyncLookupFunction {
     private transient volatile FailoverAlertNotifier alertNotifier;
     /** 是否已完成初始化（保证 ensureOpened 幂等） */
     private transient volatile boolean initialized;
+    /** 是否已关闭；防止 close 之后迟到的 asyncLookup 又把线程/连接重新建起来 */
+    private transient volatile boolean closed;
     /** 并行子任务标识（如 1/4），由 open(FunctionContext) 解析；拿不到时为空 */
     private transient String subtaskLabel = "";
+    /** 当前子任务的指标组；告警指标注册失败时退化为 no-op */
+    private transient MetricGroup metricGroup;
 
     public DualLookupFunction(DualLookupOptions.Config cfg,
                               String tableName,
@@ -148,6 +157,8 @@ public class DualLookupFunction extends AsyncLookupFunction {
         // 再调一次：静态块可能在 Log4j2 配置完成之前执行，open 时确保最终生效。
         silencePushGatewayReporter();
         subtaskLabel = resolveSubtaskLabel(context);
+        // 单测/常量折叠等场景可能传 null FunctionContext；指标拿不到就退化为 no-op
+        metricGroup = context == null ? null : context.getMetricGroup();
         ensureOpened();
     }
 
@@ -187,41 +198,59 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * 反射失败不影响统计主流程。
      */
     private static String resolveSubtaskLabel(FunctionContext context) {
-        if (context == null) {
-            return "";
-        }
-        try {
-            Object taskInfo = null;
+        if (context != null) {
             try {
-                Method method = context.getClass().getMethod("getTaskInfo");
-                taskInfo = method.invoke(context);
-            } catch (NoSuchMethodException ignored) {
-                // Flink 1.18：FunctionContext 没有 getTaskInfo()
-            }
-            if (taskInfo == null) {
-                for (Field field : FunctionContext.class.getDeclaredFields()) {
-                    if ("org.apache.flink.api.common.functions.RuntimeContext".equals(field.getType().getName())) {
-                        field.setAccessible(true);
-                        Object runtimeContext = field.get(context);
-                        if (runtimeContext != null) {
-                            Class<?> runtimeContextClass =
-                                    Class.forName("org.apache.flink.api.common.functions.RuntimeContext");
-                            taskInfo = runtimeContextClass.getMethod("getTaskInfo").invoke(runtimeContext);
+                Object taskInfo = null;
+                try {
+                    Method method = context.getClass().getMethod("getTaskInfo");
+                    taskInfo = method.invoke(context);
+                } catch (NoSuchMethodException ignored) {
+                    // Flink 1.18：FunctionContext 没有 getTaskInfo()
+                }
+                if (taskInfo == null) {
+                    // 新版本可能把 RuntimeContext 放在父类/内部字段，按类型扫描整条继承链
+                    for (Class<?> clazz = context.getClass();
+                         clazz != null && clazz != Object.class; clazz = clazz.getSuperclass()) {
+                        for (Field field : clazz.getDeclaredFields()) {
+                            if ("org.apache.flink.api.common.functions.RuntimeContext"
+                                    .equals(field.getType().getName())) {
+                                field.setAccessible(true);
+                                Object runtimeContext = field.get(context);
+                                if (runtimeContext != null) {
+                                    Class<?> runtimeContextClass =
+                                            Class.forName("org.apache.flink.api.common.functions.RuntimeContext");
+                                    taskInfo = runtimeContextClass.getMethod("getTaskInfo").invoke(runtimeContext);
+                                }
+                                break;
+                            }
                         }
-                        break;
+                        if (taskInfo != null) {
+                            break;
+                        }
                     }
                 }
+                if (taskInfo != null) {
+                    Class<?> taskInfoClass = Class.forName("org.apache.flink.api.common.TaskInfo");
+                    int index = (Integer) taskInfoClass.getMethod("getIndexOfThisSubtask").invoke(taskInfo);
+                    int parallelism = (Integer) taskInfoClass
+                            .getMethod("getNumberOfParallelSubtasks").invoke(taskInfo);
+                    return (index + 1) + "/" + parallelism;
+                }
+            } catch (Throwable ignored) {
+                // 反射失败只是不显示子任务编号，不影响统计
             }
-            if (taskInfo != null) {
-                Class<?> taskInfoClass = Class.forName("org.apache.flink.api.common.TaskInfo");
-                int index = (Integer) taskInfoClass.getMethod("getIndexOfThisSubtask").invoke(taskInfo);
-                int parallelism = (Integer) taskInfoClass.getMethod("getNumberOfParallelSubtasks").invoke(taskInfo);
-                return (index + 1) + "/" + parallelism;
-            }
-        } catch (Throwable ignored) {
-            // 反射失败只是不显示子任务编号，不影响统计
         }
-        return "";
+        // 兜底：Flink 任务线程名通常带有 (1/4) 这样的子任务标识
+        return parseSubtaskLabel(Thread.currentThread().getName());
+    }
+
+    /** 从任务线程名中提取 i/N；测试可直接断言，避免依赖具体 Flink 线程命名实现 */
+    static String parseSubtaskLabel(String threadName) {
+        if (threadName == null) {
+            return "";
+        }
+        Matcher matcher = SUBTASK_PATTERN.matcher(threadName);
+        return matcher.find() ? matcher.group(1) + "/" + matcher.group(2) : "";
     }
 
     /**
@@ -232,6 +261,9 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * volatile + synchronized 双重保证：既不会被重复初始化，也不会读到半个初始化状态。
      */
     private synchronized void ensureOpened() {
+        if (closed) {
+            throw new IllegalStateException("[dual-lookup] function already closed");
+        }
         if (initialized) {
             return;
         }
@@ -249,8 +281,18 @@ public class DualLookupFunction extends AsyncLookupFunction {
         // 限流间隔从「秒」换算成「毫秒」；<=0 时闸门退化为不限流（visit 恒返回 >=0）
         failoverGate = new FailoverLogGate(cfg.failoverLogIntervalSec * 1000L);
         // 告警器同样是「装配即可用」：未启用（threshold<=0）时返回 null，热路径只多一次判空；
-        // 启用时也只构造对象，Kafka 生产者要等第一次真正触发才创建（见 KafkaAlertSink）
-        alertNotifier = FailoverAlertNotifier.create(cfg, tableName, subtaskLabel);
+        // 启用时也只构造对象，Kafka 生产者要等第一次真正触发才创建（见 KafkaAlertSink）。
+        // 初始化本身也必须兜底：类加载失败、线程池创建失败等都不能把算子启动带崩。
+        try {
+            alertNotifier = cfg.alertThreshold > 0
+                    ? FailoverAlertNotifier.create(cfg, tableName, subtaskLabel,
+                            AlertMetrics.of(metricGroup))
+                    : null;
+        } catch (Throwable t) {
+            alertNotifier = null;
+            LOG.warn("[dual-lookup] 表={} 连续降级告警初始化失败（已禁用告警，不影响维表查询）：{}",
+                    tableName, t.toString());
+        }
         initialized = true;
     }
 
@@ -271,7 +313,10 @@ public class DualLookupFunction extends AsyncLookupFunction {
                 + " failover.interval=" + cfg.failoverLogIntervalSec + "s"
                 // 告警只在启用时才出现在回执里：默认配置的日志行不该被一串「未启用」的字段占满
                 + (cfg.alertThreshold > 0
-                        ? " alert.threshold=" + cfg.alertThreshold + " alert.topic=" + cfg.alertKafkaTopic
+                        ? " alert.threshold=" + cfg.alertThreshold
+                                + " alert.topic=" + cfg.alertKafkaTopic
+                                + " alert.cooldown=" + cfg.alertCooldownMinutes + "m"
+                                + " alert.recovery=" + cfg.alertRecovery
                         : "");
     }
 
@@ -283,6 +328,12 @@ public class DualLookupFunction extends AsyncLookupFunction {
      */
     @Override
     public CompletableFuture<Collection<RowData>> asyncLookup(RowData keyRow) {
+        // 关闭后迟到的调用直接失败，不能重新初始化线程池/连接
+        if (closed) {
+            CompletableFuture<Collection<RowData>> f = new CompletableFuture<>();
+            f.completeExceptionally(new IllegalStateException("[dual-lookup] function already closed"));
+            return f;
+        }
         // 双检锁：initialized 是 volatile，正常情况下这里只读一次标志就返回，
         // 不必每条记录都去抢一次 synchronized 方法的锁（那是热路径上纯浪费的固定开销）
         if (!initialized) {
@@ -497,14 +548,18 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * 几分钟就能把 Kafka 灌成另一个日志洪峰——这正是降级 WARN 当初要限流的原因。
      */
     private void notifyPrimarySuccess() {
+        if (closed) {
+            return;
+        }
         FailoverAlertNotifier notifier = alertNotifier;
         if (notifier == null) {
             return;
         }
         try {
             notifier.onPrimarySuccess();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
             // 旁路：复位失败最多导致「本轮不再重复推送」，不影响任何一次查询
+            LOG.warn("[dual-lookup] 连续降级告警复位失败（不影响维表查询）：{}", t.toString());
         }
     }
 
@@ -516,14 +571,18 @@ public class DualLookupFunction extends AsyncLookupFunction {
      * 调整日志限流就会悄悄改变告警时机，这种耦合在故障复盘时极难还原。
      */
     private void notifyFailover(int keys, Throwable cause) {
+        if (closed) {
+            return;
+        }
         FailoverAlertNotifier notifier = alertNotifier;
         if (notifier == null) {
             return;
         }
         try {
             notifier.onFailover(keys, cause);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
             // 同上：告警出任何问题都不能冒泡到降级链路
+            LOG.warn("[dual-lookup] 连续降级告警处理失败（不影响维表查询）：{}", t.toString());
         }
     }
 
@@ -680,7 +739,9 @@ public class DualLookupFunction extends AsyncLookupFunction {
     @Override
     public void close() throws Exception {
         // 先宣告关闭，再做清理：clearing 期间到达的降级链（call()）会看到 initialized=false，
-        // 直接走「已关闭」异常分支，而不是在 close 进行途中重新 open() 出一个没人关的连接
+        // 直接走「已关闭」异常分支，而不是在 close 进行途中重新 open() 出一个没人关的连接。
+        // closed 与 initialized 分开：closed 必须阻止迟到 asyncLookup 重新 ensureOpened()。
+        closed = true;
         initialized = false;
         // 兜底：把攒批缓冲里尚未 flush 的请求补空，避免异步算子等待永不完成的 future
         if (lock != null) {
@@ -710,9 +771,17 @@ public class DualLookupFunction extends AsyncLookupFunction {
         if (batchScheduler != null) {
             batchScheduler.shutdownNow();
         }
-        // 两个 Reader 都关：即便某个从未建连，close() 也应容忍（内部做了 null 判断）
-        primary.close();
-        standby.close();
+        // 两个 Reader 都关：即便某个从未建连或关闭失败，也要尝试关闭另一个
+        try {
+            primary.close();
+        } catch (Throwable t) {
+            LOG.warn("[dual-lookup] 主源关闭异常（已继续关闭备源）：{}", t.toString());
+        }
+        try {
+            standby.close();
+        } catch (Throwable t) {
+            LOG.warn("[dual-lookup] 备源关闭异常（已忽略，不影响作业退出）：{}", t.toString());
+        }
     }
 
     // ---------------- 键值转换 ----------------
